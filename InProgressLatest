@@ -1,0 +1,879 @@
+import os
+import asyncio
+import json
+import time
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAI
+
+# ========== Gemini Setup ==========
+# It's strongly recommended to load the API key from environment variables
+# instead of hardcoding it directly in the script for security reasons.
+# Example: os.environ.get("GOOGLE_API_KEY")
+# Make sure to set GOOGLE_API_KEY in your environment before running the script.
+# Replace with your actual method for loading the API key securely.
+# For demonstration, using a placeholder, but strongly advise using environment variables.
+# os.environ["GOOGLE_API_KEY"] = "YOUR_API_KEY_HERE" # Replace with your actual key or env var loading
+os.environ["GOOGLE_API_KEY"] = "AIzaSyBCEpWxGASB5v7EKc6EMTA4Y14UjV-6s2g" # Replace with your actual key or env var loading
+llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=os.environ["GOOGLE_API_KEY"])
+# Check if GOOGLE_API_KEY is set, preferably from environment variables
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    # Fallback to a hardcoded key ONLY for testing/demonstration if necessary,
+    # but remove this line in production.
+    # print("Warning: GOOGLE_API_KEY environment variable not set. Using hardcoded key (not recommended).")
+    # GOOGLE_API_KEY = "AIzaSyBCEpWxGASB5v7EKc6EMTA4Y14UjV-6s2g" # Replace with your hardcoded key if absolutely necessary for testing
+
+    # If no key is found (neither env var nor hardcoded), raise an error
+    if not GOOGLE_API_KEY:
+         raise ValueError("GOOGLE_API_KEY environment variable not set and no hardcoded key provided.")
+
+
+llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+
+
+# ========== Semantic Parsing ==========
+def parse_semantic_elements(html):
+    """
+    Parses HTML to find interactive elements, including draggable divs and sliders,
+    and table data, generating specific selectors.
+    Returns a tuple: (json_string_of_standard_elements, list_of_table_row_data)
+    """
+    # Use lxml for parsing, it's generally faster and more robust
+    soup = BeautifulSoup(html, 'lxml')
+    elements = [] # List for standard interactive elements, draggable divs, and sliders
+    table_data = [] # List to store structured table data
+
+    # Parse standard interactive elements AND draggable divs AND sliders
+    # Added 'div' and handling for input type="range"
+    for tag in soup.find_all(['button', 'input', 'form', 'a', 'label', 'textarea', 'select', 'div']):
+        # Skip elements that are likely within table action cells, they are handled separately
+        if tag.find_parent('td') and tag.find_parent('tr') and tag.find_parent('tbody'):
+             continue
+
+        # Check if the element is explicitly marked as draggable
+        is_draggable = tag.get("draggable") == "true"
+        # Check if the element is a range slider
+        is_slider = tag.name == 'input' and tag.get("type") == "range"
+
+
+        label = (
+            tag.get_text(strip=True) or tag.get("placeholder") or
+            tag.get("aria-label") or tag.get("name") or tag.get("id") or tag.name
+        )
+        summary = {
+            "tag": tag.name,
+            "text": tag.get_text(strip=True),
+            "name": tag.get("name"),
+            "id": tag.get("id"),
+            "type": tag.get("type"),
+            "value": tag.get("value"),
+            "placeholder": tag.get("placeholder"),
+            "aria_label": tag.get("aria-label"),
+            "classes": " ".join(tag.get("class", [])),
+            "description": label,
+            "draggable": is_draggable, # Add draggable attribute status
+            "is_slider": is_slider, # Add slider status
+        }
+
+        # If it's a slider, add min, max, and step attributes
+        if is_slider:
+            summary["min"] = tag.get("min")
+            summary["max"] = tag.get("max")
+            summary["step"] = tag.get("step")
+
+
+        # --- Improved Selector Generation for Inputs, Textareas, Divs, Sliders and general tags ---
+        selector_parts = []
+        if tag.get("id"):
+            selector_parts.append(f"#{tag['id']}")
+        elif tag.get("name"):
+            # Include type for inputs if name is present for better specificity
+            if tag.name == 'input' and tag.get("type"):
+                 selector_parts.append(f"{tag.name}[type='{tag['type']}'][name='{tag['name']}']")
+            # For textarea with name
+            elif tag.name == 'textarea':
+                 selector_parts.append(f"{tag.name}[name='{tag['name']}']")
+            else:
+                 selector_parts.append(f"{tag.name}[name='{tag['name']}']")
+        elif tag.get("type") and tag.name == 'input':
+             # If no id/name, but it's an input with a type, use type
+             selector_parts.append(f"{tag.name}[type='{tag['type']}']")
+        elif tag.get("placeholder"):
+             # Use a more robust attribute for placeholder if available, or just tag name
+            selector_parts.append(f"{tag.name}[placeholder*='{tag['placeholder']}']")
+        # Add handling for divs with text content or class
+        elif tag.name == 'div' and tag.get_text(strip=True):
+             # Use tag name and text content if it's a div with text
+             # Using :has-text() which is a Playwright extension and generally more reliable
+             selector_parts.append(f"{tag.name}:has-text('{tag.get_text(strip=True)}')")
+        elif tag.get("class"):
+             # Add classes for better specificity if no id/name/placeholder/type/text (for div)
+             selector_parts.append(f"{tag.name}.{'.'.join(tag['class'])}")
+        else:
+             selector_parts.append(tag.name) # Fallback to just tag name
+
+
+        # Combine parts to form a basic selector. This might not be unique.
+        # Playwright's locators are often more robust than simple CSS selectors generated this way.
+        summary["selector"] = " ".join(selector_parts)
+
+        # Handle <select> elements and their options
+        if tag.name == "select":
+            options = []
+            for option in tag.find_all("option"):
+                option_value = option.get("value")
+                option_text = option.get_text(strip=True)
+                # Refine option selector for better specificity
+                option_selector = f"{tag.name}{summary.get('selector', '')}[value='{option_value}']" if summary.get('selector') else f"{tag.name}[value='{option_value}']"
+                options.append({
+                    "value": option_value,
+                    "text": option_text,
+                    "selector": option_selector,
+                })
+            summary["options"] = options
+
+        elements.append(summary)
+
+
+    # Add table parsing logic to find rows and action buttons within them (existing logic)
+    tables = soup.find_all('table')
+
+    for table in tables:
+        # Attempt to get table headers for better context for the LLM
+        headers = [th.get_text(strip=True) for th in table.select('thead th')]
+        rows = table.select('tbody tr')
+
+        for i, row in enumerate(rows):
+            row_summary = {"row_index": i}
+            cells = row.select('td')
+            row_text_data = {} # Use dictionary for key-value pairs for easier access
+            action_elements = [] # List to store action buttons/links in this row
+
+            # Generate a base selector for this specific row using nth-of-type
+            # This makes the row selector specific to its position in the tbody
+            row_base_selector = f"table tbody tr:nth-of-type({i+1})"
+            # Add table class to base selector if available for more specificity
+            if table.get("class"):
+                row_base_selector = f"table.{'.'.join(table['class'])} tbody tr:nth-of-type({i+1})"
+
+
+            for j, cell in enumerate(cells):
+                cell_text = cell.get_text(strip=True)
+                # Use header text as key if available, otherwise use column index
+                col_key = headers[j] if j < len(headers) else f"col_{j}" # Handle case where headers might be fewer than columns
+                row_text_data[col_key] = cell_text
+
+                # Find interactive elements within this cell (potential action buttons/links)
+                # Look for both button and anchor tags
+                for action_tag in cell.find_all(['button', 'a']):
+                     action_text = action_tag.get_text(strip=True)
+                     if action_text: # Only consider elements with visible text as potential actions
+                         # Generate a specific selector for this action element within this row
+                         # Use the text content and tag name for targeting within the specific row selector
+                         # Using :has-text() which is a Playwright extension and generally more reliable
+                         action_selector = f"{row_base_selector} {action_tag.name}:has-text('{action_text}')"
+                         # Add class for more specificity if available
+                         if action_tag.get("class"):
+                              action_selector = f"{row_base_selector} {action_tag.name}.{'.'.join(action_tag['class'])}:has-text('{action_text}')"
+
+
+                         action_elements.append({
+                             "tag": action_tag.name,
+                             "text": action_text,
+                             "selector": action_selector,
+                             # Create a descriptive label for the LLM
+                             "description": f"'{action_text}' button/link for row with data: {', '.join([f'{k}: {v}' for k, v in row_text_data.items()])}"
+                         })
+
+            row_summary["data"] = row_text_data
+            row_summary["actions"] = action_elements
+            table_data.append(row_summary)
+
+    # Return both standard elements (limited to 30) and the full table data
+    # The LLM will use table_data for row-specific actions
+    return json.dumps(elements[:30], indent=2), table_data
+
+def find_description(elements_list_json, table_data_list, selector):
+    """
+    Finds the description for a selector, checking both standard elements and table row actions.
+    Prioritizes table data actions if a match is found there.
+    """
+    try:
+        # Check table data actions first as they have more specific descriptions
+        for row in table_data_list:
+            for action in row.get("actions", []):
+                if action.get("selector") == selector:
+                    return action.get("description", selector)
+
+        # If not found in table data, check standard elements
+        elements = json.loads(elements_list_json)
+        for el in elements:
+            if el.get("selector") == selector:
+                return el.get("description", selector)
+
+    except Exception as e:
+        print(f"Error finding description: {e}")
+        pass
+    return selector
+
+# ========== Visual Debugging ==========
+async def highlight_element(page, selector):
+    """Highlights an element on the page with a red outline."""
+    # Escape single quotes and backslashes in the selector for the JavaScript string
+    escaped_selector = selector.replace("\\", "\\\\").replace("'", "\\'")
+    script = f"""
+        const el = document.querySelector("{escaped_selector}");
+        if (el) {{
+            el.style.outline = '4px solid red';
+            el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+        }} else {{
+            console.warn("Element not found for highlighting:", "{escaped_selector}");
+        }}
+    """
+    try:
+        await page.evaluate(script)
+    except Exception as e:
+        print(f"[❌ Failed to highlight element '{selector}']: {e}")
+
+
+async def save_screenshot(page, step_count, selector=None):
+    """Saves a screenshot of the page after optionally highlighting an element."""
+    os.makedirs("screenshots", exist_ok=True)
+    # Highlight before saving the screenshot if a selector is provided
+    if selector:
+        await highlight_element(page, selector)
+    filename = f"screenshots/step_{step_count}_{int(time.time())}.png"
+    try:
+        await page.screenshot(path=filename, full_page=True)
+        print(f"[🖼 Screenshot saved]: {filename}")
+    except Exception as e:
+        print(f"[❌ Failed to save screenshot]: {e}")
+
+
+# ========== Fallback Logic ==========
+async def fallback_by_text(page, text, action):
+    """
+    Attempts to find and interact with an element using text content as a fallback.
+    Note: Fallback by text might not be suitable for specific table row buttons
+    if the text is not unique on the page.
+    """
+    if not text: # Cannot fallback by text if no text is provided
+        return False
+    try:
+        # Use Playwright's text locator which is more robust
+        locator = page.get_by_text(text, exact=False).first
+        # Check if the element is visible and enabled before interacting
+        if not await locator.is_visible() or not await locator.is_enabled():
+             print(f"[⚠️ Fallback element found by text '{text}' but not visible or enabled]")
+             return False
+
+        await locator.scroll_into_view_if_needed()
+        if action == "click":
+            await locator.click()
+        elif action == "submit":
+             # Fallback submit by text might not be reliable, consider alternatives
+            await locator.press("Enter")
+        elif action == "extract":
+            content = await locator.inner_text()
+            print("\n[📄 Extracted via fallback]:", content)
+            return True # Indicate extraction success
+        print(f"[✅ Fallback success using text match]: '{text}' for action '{action}'")
+        return True
+    except Exception as e:
+        print(f"[❌ Fallback failed for text '{text}' and action '{action}']: {e}")
+        return False
+
+# ========== Citation Logic ==========
+def create_citation(action, description, value=None, source=None, target=None):
+    """Generates a human-readable citation for an action."""
+    if action == "type":
+        return f"Action: Type '{value}' into '{description}'"
+    elif action == "click":
+        return f"Action: Clicked on '{description}'"
+    elif action == "check":
+        return f"Action: Checked '{description}'"
+    elif action == "submit":
+        return f"Action: Submitted form via '{description}'"
+    elif action == "extract":
+        return f"Action: Extracted content from '{description}'"
+    elif action == "select_dropdown":
+        return f"Action: Selected value '{value}' in dropdown '{description}'"
+    elif action == "drag_and_drop":
+        return f"Action: Dragged '{source}' to '{target}' - {description}" # Include source/target selectors
+    elif action == "set_slider": # Added citation for set_slider
+        return f"Action: Set slider '{description}' to value '{value}'"
+    return f"Action: Performed '{action}' on '{description}'"
+
+# ========== Main Automation Agent ==========
+async def run_browser_agent(instruction: str, start_url: str):
+    """
+    Runs the browser automation agent based on a natural language instruction.
+    """
+    playwright_code = [] # Stores Playwright code snippets for logging
+    citations = []  # Collect citations here
+
+    async with async_playwright() as p:
+        # Launch browser - headless=False shows the browser window
+        browser = await p.chromium.launch(headless=False, slow_mo=100)
+        page = await browser.new_page()
+        print(f"Navigating to {start_url}")
+        try:
+            await page.goto(start_url)
+            print("Navigation complete.")
+        except Exception as e:
+            print(f"[❌ Failed to navigate to {start_url}]: {e}")
+            await browser.close()
+            return # Exit if initial navigation fails
+
+
+        step = 0
+        completed_actions = [] # Keep track of actions for the LLM context
+        retries = 0
+        max_retries = 3 # Max retries for a single step or LLM call
+
+        # Define the prompt template for the LLM
+        prompt = PromptTemplate(
+            input_variables=["url", "elements", "table_data", "instruction", "completed_actions", "history"],
+            template="""
+You are an intelligent web automation agent. Your goal is to perform actions on the webpage based on the user's instruction.
+
+Current Page URL: {url}
+
+HTML Elements List (up to 30 non-table interactive elements, including draggable and slider elements):
+{elements}
+
+Table Data Found:
+{table_data}
+
+User's Main Instruction:
+"{instruction}"
+
+Actions Completed So Far:
+{completed_actions}
+
+Short History Memory (recent errors or key events):
+{history}
+
+Choose the next action as JSON. Respond ONLY with the JSON object.
+{{
+  "action": "click" | "type" | "submit" | "check" | "extract" | "done" | "navigate_back" | "navigate_forward" | "navigate_to" | "select_dropdown" | "drag_and_drop" | "set_slider",
+  "selector": "CSS selector for the target element (required for most actions except navigate_back/forward/to)",
+  "source_selector": "CSS selector for the element to drag (required for drag_and_drop)",
+  "target_selector": "CSS selector for the element to drop onto (required for drag_and_drop)",
+  "text": "Text to type (if action is 'type')",
+  "value": "Value to select (if action is 'select_dropdown') or value to set for a slider (if action is 'set_slider')",
+  "url": "URL to visit (if action is 'navigate_to')",
+  "description": "A brief, human-readable description of the action being taken (e.g., 'Click Edit for Ipad row', 'Check the Product checkbox', 'Select Product radio button', 'Type comments in Comments textarea', 'Drag column A to column B', 'Set slider to 3.5')"
+}}
+
+Instructions for Action Selection:
+- Analyze the 'User's Main Instruction' to understand the overall goal.
+- Review the 'HTML Elements List' for general interactive elements (buttons, inputs, links, checkboxes, radio buttons, textareas, select dropdowns, etc.) INCLUDING elements marked as draggable and **slider inputs (type="range")**. Pay attention to input elements with type="checkbox", type="radio", type="range", textarea elements, and elements with `draggable="true"`.
+- Review the 'Table Data Found' for structured information in tables, including row data and specific action buttons/links within each row.
+- If the instruction refers to interacting with a specific table row (e.g., "Click Delete for the row with Product Company is 'Samsung'", "Edit the entry for Apple"), identify the matching row in 'Table Data Found' based on the row's 'data'.
+- Find the corresponding action (e.g., 'Delete', 'Edit', 'View Details', 'Activate') within that row's 'actions' list based on the button/link text mentioned in the instruction.
+- Use the 'selector' provided for that specific action element in the chosen row as the 'selector' for the 'click' action. This selector is unique to the button/link within that particular row.
+- If the instruction requires typing text into a text input field or a textarea, find the relevant input or textarea element in the 'HTML Elements List' and use its 'selector' with the "type" action and the specified 'text'. Identify these elements by their name, id, placeholder, or associated label.
+- If the instruction requires checking a checkbox or selecting a radio button, find the relevant input element in the 'HTML Elements List' (or potentially table data if checkboxes are in a table) and use its 'selector' with the "check" action. Identify checkboxes/radio buttons by their type="checkbox" or type="radio", name, value, or associated text/label.
+- For radio buttons, the instruction might specify the value to select (e.g., "Set Type to 'Product'"). Find the radio button input with the correct 'name' attribute (for the group) and the correct 'value' attribute or associated text, and use its specific selector with the "check" action.
+- **If the instruction asks to set the value of a horizontal slider, identify the slider input element (type="range") in the 'HTML Elements List'. Use the 'set_slider' action, the slider's 'selector', and provide the desired numerical 'value'. Consider the slider's 'min', 'max', and 'step' attributes when choosing a value.**
+- If the instruction requires performing a drag and drop operation (e.g., "Drag element A to element B", "Swap column A and B", "Move column B to column A"), identify the source and target elements from the 'HTML Elements List' based on the instruction (using text content, IDs like 'column-a', 'column-b', or other attributes like 'draggable="true"').
+- Use the 'selector' of the source element as the 'source_selector' and the 'selector' of the target element as the 'target_selector' for the "drag_and_drop" action.
+- For other actions (click, etc.) not involving a specific table row, checkbox/radio button, textarea, drag/drop, or slider, find the relevant element in the 'HTML Elements List' and use its 'selector'.
+- If the task is complete according to the instruction, set the action to "done".
+- Always provide a clear and descriptive 'description' for the action, especially for table row interactions, filling/checking elements, drag and drop operations, or setting slider values, to make the process understandable.
+- Ensure the 'selector', 'source_selector', and 'target_selector' are accurate and target the intended elements.
+
+Example JSON for clicking an Edit button in a table row:
+{{
+  "action": "click",
+  "selector": "table.table.table-bordered tbody tr:nth-of-type(1) button:has-text('Edit')",
+  "description": "Click Edit button for row with Product Name Ipad"
+}}
+
+Example JSON for typing in an input field:
+{{
+  "action": "type",
+  "selector": "#productNameInput",
+  "text": "New Product Name",
+  "description": "Type 'New Product Name' into Product Name field"
+}}
+
+Example JSON for clicking a general button:
+{{
+  "action": "click",
+  "selector": "button:has-text('Add Product')",
+  "description": "Click Add Product button"
+}}
+
+Example JSON for checking a checkbox:
+{{
+  "action": "check",
+  "selector": "input[type='checkbox'][name='isAvailable']",
+  "description": "Check the IsAvailable checkbox"
+}}
+
+Example JSON for selecting a radio button with a specific value:
+{{
+  "action": "check",
+  "selector": "input[type='radio'][name='productType'][value='Product']",
+  "description": "Select 'Product' radio button for Type"
+}}
+
+Example JSON for typing into a textarea:
+{{
+  "action": "type",
+  "selector": "textarea[name='Comments']",
+  "text": "Launch in Q3",
+  "description": "Type comments in Comments textarea"
+}}
+
+Example JSON for dragging and dropping:
+{{
+  "action": "drag_and_drop",
+  "source_selector": "#column-a",
+  "target_selector": "#column-b",
+  "description": "Drag column A to column B"
+}}
+
+Example JSON for setting a slider value:
+{{
+  "action": "set_slider",
+  "selector": "input[type='range']",
+  "value": 3.5,
+  "description": "Set the horizontal slider value to 3.5"
+}}
+
+
+Respond only with valid JSON.
+""")
+
+        chain = prompt | llm # Create the LangChain chain
+        history = "" # Simple history string
+
+        # Main automation loop
+        while step < 30: # Limit steps to prevent infinite loops
+            print(f"\n--- Step {step} ---")
+            try:
+                html = await page.content()
+                # Parse both standard elements (including draggable and sliders) and table data
+                element_summaries_json, table_data_list = parse_semantic_elements(html)
+                url = page.url
+
+                # Prepare table data for the LLM prompt (using JSON dump for structure)
+                # This provides the LLM with the details of each row and its actions
+                table_data_for_prompt = json.dumps(table_data_list, indent=2)
+
+                # Invoke the LLM with the current page context and instruction
+                print("Invoking LLM to determine next action...")
+                response = await chain.ainvoke({
+                    "url": url,
+                    "elements": element_summaries_json,
+                    "table_data": table_data_for_prompt, # Pass the structured table data
+                    "instruction": instruction,
+                    "completed_actions": json.dumps(completed_actions), # Pass completed actions
+                    "history": history, # Pass simple history
+                })
+                print("[🔴 LLM Response Received]")
+
+                # Clean and parse the LLM's JSON response
+                cleaned_response = response.strip().removeprefix("```json").removesuffix("```").strip()
+                action_dict = json.loads(cleaned_response)
+                retries = 0 # Reset retries on successful LLM response parsing
+
+            except json.JSONDecodeError as e:
+                print(f"[❌ Failed to parse LLM JSON response]: {e}")
+                print(f"Raw response: {response}")
+                retries += 1
+                history += f"\n[Error parsing LLM response at step {step}]"
+                if retries > max_retries:
+                    print("[💥 Too many JSON parsing retries. Exiting.]")
+                    break
+                await page.wait_for_timeout(1000) # Wait a bit before retrying
+                continue # Skip to next loop iteration
+
+            except Exception as e:
+                 print(f"[❌ An unexpected error occurred during LLM invocation or processing]: {e}")
+                 retries += 1
+                 history += f"\n[Unexpected error at step {step}: {e}]"
+                 if retries > max_retries:
+                    print("[💥 Too many unexpected errors. Exiting.]")
+                    break
+                 await page.wait_for_timeout(1000) # Wait a bit before retrying
+                 continue # Skip to next loop iteration
+
+
+            action = action_dict.get("action")
+            # Get selectors for different action types
+            selector = action_dict.get("selector")
+            source_selector = action_dict.get("source_selector")
+            target_selector = action_dict.get("target_selector")
+
+            text = action_dict.get("text", "")
+            value = action_dict.get("value") # Get value for set_slider and select_dropdown
+            nav_url = action_dict.get("url", "")
+            # Get the optional description from the LLM's response
+            action_description = action_dict.get("description") # Get description if provided
+
+            # Determine the primary selector for highlighting and citation if not drag_and_drop
+            primary_selector_for_highlight = selector
+
+            if action == "done":
+                print("\n[✅ Task completed by the agent as instructed]")
+                break # Exit the loop if the LLM says the task is done
+
+            # Perform the action using Playwright
+            try:
+                # Handle different action types
+                if action == "type":
+                    if not selector:
+                        print(f"[⚠️ Action '{action}' requires a 'selector', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action (highlights the selector)
+                    await save_screenshot(page, step, primary_selector_for_highlight)
+
+                    print(f"Typing '{text}' into element with selector '{selector}'")
+                    await page.fill(selector, text)
+                    playwright_code.append(f"await page.fill('{selector}', '{text}')")
+                    desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                    completed_actions.append(f"Typed '{text}' in '{desc}'")
+                    citation = create_citation(action, desc, value=text)
+
+
+                elif action == "click":
+                    if not selector:
+                        print(f"[⚠️ Action '{action}' requires a 'selector', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action (highlights the selector)
+                    await save_screenshot(page, step, primary_selector_for_highlight)
+
+                    print(f"Clicking element with selector '{selector}'")
+                    await page.click(selector)
+                    playwright_code.append(f"await page.click('{selector}')")
+                    desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                    completed_actions.append(f"Clicked on '{desc}'")
+                    citation = create_citation(action, desc)
+
+
+                elif action == "submit":
+                     if not selector:
+                        print(f"[⚠️ Action '{action}' requires a 'selector', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                     # Save screenshot before performing the action (highlights the selector)
+                     await save_screenshot(page, step, primary_selector_for_highlight)
+
+                     print(f"Submitting via element with selector '{selector}'")
+                     await page.locator(selector).press("Enter")
+                     playwright_code.append(f"await page.locator('{selector}').press('Enter')")
+                     desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                     completed_actions.append(f"Submitted form via '{desc}'")
+                     citation = create_citation(action, desc)
+
+
+                elif action == "check":
+                    if not selector:
+                        print(f"[⚠️ Action '{action}' requires a 'selector', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action (highlights the selector)
+                    await save_screenshot(page, step, primary_selector_for_highlight)
+
+                    print(f"Checking element with selector '{selector}'")
+                    await page.locator(selector).check()
+                    playwright_code.append(f"await page.locator('{selector}').check()")
+                    desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                    completed_actions.append(f"Checked '{desc}'")
+                    citation = create_citation(action, desc)
+
+
+                elif action == "extract":
+                    if not selector:
+                        print(f"[⚠️ Action '{action}' requires a 'selector', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action (highlights the selector)
+                    await save_screenshot(page, step, primary_selector_for_highlight)
+
+                    print(f"Extracting text from element with selector '{selector}'")
+                    content = await page.inner_text(selector)
+                    playwright_code.append(f"await page.inner_text('{selector}')")
+                    desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                    completed_actions.append(f"Extracted content from '{desc}'")
+                    citation = create_citation(action, desc)
+                    print("\n[📄 Extracted Content]:", content)
+
+
+                elif action == "navigate_back":
+                     # Save screenshot before navigation
+                     await save_screenshot(page, step)
+
+                     print("Navigating back")
+                     await page.go_back()
+                     playwright_code.append(f"await page.go_back()")
+                     completed_actions.append("Navigated back")
+                     citation = create_citation(action, "Previous page")
+
+                elif action == "navigate_forward":
+                     # Save screenshot before navigation
+                     await save_screenshot(page, step)
+
+                     print("Navigating forward")
+                     await page.go_forward()
+                     playwright_code.append(f"await page.go_forward()")
+                     completed_actions.append("Navigated forward")
+                     citation = create_citation(action, "Next page")
+
+                elif action == "navigate_to":
+                     if not nav_url:
+                         print(f"[⚠️ Action '{action}' requires a 'url', but none was provided. Retrying...]")
+                         retries += 1
+                         history += f"\n[Action '{action}' missing url at step {step}]"
+                         if retries > max_retries:
+                             print("[💥 Exiting after max retries for missing url]")
+                             break
+                         await page.wait_for_timeout(1000)
+                         continue # Skip to next loop iteration
+
+                     # Save screenshot before navigation
+                     await save_screenshot(page, step)
+
+                     print(f"Navigating to {nav_url}")
+                     await page.goto(nav_url)
+                     playwright_code.append(f"await page.goto('{nav_url}')")
+                     completed_actions.append(f"Navigated to {nav_url}")
+                     citation = create_citation(action, nav_url)
+
+
+                elif action == "select_dropdown":
+                    if not selector or value is None: # Value can be 0 or '', so check for None
+                        print(f"[⚠️ Action '{action}' requires a 'selector' and 'value', but one was missing. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector or value at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector/value]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action (highlights the selector)
+                    await save_screenshot(page, step, primary_selector_for_highlight)
+
+                    print(f"Selecting value '{value}' in dropdown with selector '{selector}'")
+                    await page.select_option(selector, value=str(value)) # Ensure value is a string
+                    playwright_code.append(f"await page.select_option('{selector}', value='{value}')")
+                    desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                    completed_actions.append(f"Selected '{value}' in '{desc}' dropdown")
+                    citation = create_citation(action, desc, value=value)
+
+
+                elif action == "drag_and_drop":
+                     if not source_selector or not target_selector:
+                         print(f"[⚠️ Action '{action}' requires 'source_selector' and 'target_selector', but one was missing. Retrying...]")
+                         retries += 1
+                         history += f"\n[Action '{action}' missing selectors at step {step}]"
+                         if retries > max_retries:
+                             print("[💥 Exiting after max retries for missing selectors]")
+                             break
+                         await page.wait_for_timeout(1000)
+                         continue # Skip to next loop iteration
+
+                     # Highlight source and target before performing the action
+                     await highlight_element(page, source_selector)
+                     await highlight_element(page, target_selector)
+                     await save_screenshot(page, step, None) # Save screenshot with both highlighted
+
+
+                     print(f"Dragging element with selector '{source_selector}' to element with selector '{target_selector}'")
+                     await page.locator(source_selector).drag_to(page.locator(target_selector))
+                     playwright_code.append(f"await page.locator('{source_selector}').drag_to(page.locator('{target_selector}'))")
+                     source_desc = find_description(element_summaries_json, table_data_list, source_selector) or source_selector
+                     target_desc = find_description(element_summaries_json, table_data_list, target_selector) or target_selector
+                     desc = action_description if action_description else f"from '{source_desc}' to '{target_desc}'"
+                     completed_actions.append(f"Dragged '{source_desc}' to '{target_desc}'")
+                     citation = create_citation(action, desc, source=source_desc, target=target_desc)
+
+
+                # --- New Action: set_slider ---
+                elif action == "set_slider":
+                     if not selector or value is None: # Value can be 0, so check for None
+                        print(f"[⚠️ Action '{action}' requires a 'selector' and 'value', but one was missing. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector or value at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector/value]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                     # Ensure value is a number
+                     try:
+                         set_value = float(value)
+                     except (ValueError, TypeError):
+                         print(f"[⚠️ Invalid value '{value}' provided for set_slider action. Value must be numeric. Retrying...]")
+                         retries += 1
+                         history += f"\n[Action '{action}' received non-numeric value at step {step}]"
+                         if retries > max_retries:
+                             print("[💥 Exiting after max retries for invalid value]")
+                             break
+                         await page.wait_for_timeout(1000)
+                         continue # Skip to next loop iteration
+
+
+                     # Save screenshot before performing the action (highlights the selector)
+                     await save_screenshot(page, step, primary_selector_for_highlight)
+
+                     print(f"Setting slider with selector '{selector}' to value '{set_value}'")
+
+                     # Execute JavaScript to set the value and trigger events
+                     # Using page.evaluate is more reliable for triggering events than just setting value via Playwright's fill/type
+                     # Escape single quotes and backslashes in the selector for the JavaScript string
+                     escaped_selector = selector.replace("\\", "\\\\").replace("'", "\\'")
+                     js_code = f"""
+                         const slider = document.querySelector("{escaped_selector}");
+                         if (slider) {{
+                             slider.value = "{set_value}"; // Set the value (as string)
+                             // Trigger input and change events to ensure UI updates and listeners fire
+                             const inputEvent = new Event('input', {{ bubbles: true }});
+                             slider.dispatchEvent(inputEvent);
+                             const changeEvent = new Event('change', {{ bubbles: true }});
+                             slider.dispatchEvent(changeEvent);
+
+                             // Optional: Update the displayed value if there's a specific element for it
+                             // This is specific to the-internet.herokuapp.com/horizontal_slider page
+                             const rangeSpan = document.getElementById('range');
+                             if (rangeSpan) {{
+                                 rangeSpan.textContent = slider.value;
+                             }}
+
+                             console.log('Slider value set and events dispatched:', slider.value);
+                         }} else {{
+                             console.warn("Slider element not found for setting value:", "{escaped_selector}");
+                         }}
+                     """
+                     await page.evaluate(js_code)
+
+                     playwright_code.append(f"await page.evaluate(`{js_code.replace('`', '\\`')}`)") # Log the JS code executed
+                     desc = action_description if action_description else find_description(element_summaries_json, table_data_list, selector) or selector
+                     completed_actions.append(f"Set slider '{desc}' to '{set_value}'")
+                     citation = create_citation(action, desc, value=set_value)
+
+
+                else:
+                    print(f"[⚠️ Unknown action received from LLM]: {action}. Retrying...")
+                    retries += 1
+                    history += f"\n[Unknown action '{action}' at step {step}]"
+                    if retries > max_retries:
+                        print("[💥 Exiting after max retries for unknown action]")
+                        break
+                    await page.wait_for_timeout(1000)
+                    continue # Skip to next loop iteration
+
+                # Add the citation for the successfully completed action
+                citations.append(citation)
+                retries = 0 # Reset retries after successful action
+                history = "" # Clear history on successful step
+
+            except Exception as e:
+                print(f"[❌ Action failed for selector '{selector or source_selector or target_selector}' and action '{action}']: {e}")
+                retries += 1
+                history += f"\n[Action '{action}' failed for selector '{selector or source_selector or target_selector}' at step {step}]"
+
+                # Optional: Attempt fallback if action failed (e.g., click failed)
+                # if action in ["click", "submit", "extract"] and action_description: # Only fallback for specific actions if description exists
+                #     print(f"[ℹ️ Attempting fallback by text using description: '{action_description}']")
+                #     if await fallback_by_text(page, action_description, action):
+                #         print("[✅ Fallback successful]")
+                #         # Update completed actions and citation for fallback
+                #         fallback_desc = f"Fallback using text '{action_description}' for '{desc}'"
+                #         if action == "extract":
+                #              completed_actions.append(f"Extracted content via fallback using text '{action_description}'")
+                #              citation = create_citation("extract", fallback_desc) # Use extract citation
+                #         else:
+                #              completed_actions.append(f"Performed '{action}' via fallback using text '{action_description}'")
+                #              citation = create_citation(action, fallback_desc) # Use original action citation type
+                #         citations.append(citation)
+                #         retries = 0 # Reset retries on fallback success
+                #         history = "" # Clear history on fallback success
+                #         step += 1 # Increment step for fallback
+                #         await page.wait_for_timeout(500) # Wait a bit after fallback
+                #         continue # Continue to the next step
+                #     else:
+                #          print("[❌ Fallback failed]")
+
+
+                if retries > max_retries:
+                    print(f"[💥 Exiting after max retries for action '{action}']")
+                    break
+                await page.wait_for_timeout(1000) # Wait a bit before retrying
+
+
+            step += 1 # Increment step count after each attempt
+
+        await browser.close()
+
+        print("\n--- Automation Finished ---")
+        print("\nGenerated Playwright Code Snippets:")
+        for code in playwright_code:
+            print(code)
+
+        print("\nAction Citations:")
+        for citation in citations:
+            print(citation)
+
+# Example Usage:
+# To set the slider on the example page to 4:
+# asyncio.run(run_browser_agent("Set the horizontal slider to 4", "https://the-internet.herokuapp.com/horizontal_slider"))
+
+# To set the slider on the example page to 2.5:
+# asyncio.run(run_browser_agent("Move the slider to 2.5", "https://the-internet.herokuapp.com/horizontal_slider"))
+
+# To set the slider on the example page to the maximum value:
+# asyncio.run(run_browser_agent("Set the slider to its highest value", "https://the-internet.herokuapp.com/horizontal_slider"))
+
+# To set the slider on the example page to the minimum value:
+# asyncio.run(run_browser_agent("Move the slider all the way to the left", "https://the-internet.herokuapp.com/horizontal_slider"))
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=True, help="https://the-internet.herokuapp.com/horizontal_slider")
+    parser.add_argument("--instruction", required=True, help="Set the horizontal slider to 4")
+    # Example Usage (replace with actual desired URL and instruction)
+    asyncio.run(run_browser_agent(instruction="Set the horizontal slider to 4", start_url="https://the-internet.herokuapp.com/horizontal_slider"))
+    #asyncio.run(run_browser_agent(instruction, url))
