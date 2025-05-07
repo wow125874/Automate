@@ -1,0 +1,696 @@
+import os
+import asyncio
+import json
+import time
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAI
+
+# ========== Gemini Setup ==========
+# It's strongly recommended to load the API key from environment variables
+# instead of hardcoding it directly in the script for security reasons.
+# Example: os.environ.get("GOOGLE_API_KEY")
+# Make sure to set GOOGLE_API_KEY in your environment before running the script.
+os.environ["GOOGLE_API_KEY"] = "AIzaSyBCEpWxGASB5v7EKc6EMTA4Y14UjV-6s2g"
+llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=os.environ["GOOGLE_API_KEY"])
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set.")
+
+llm = GoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+
+# ========== Semantic Parsing ==========
+def parse_semantic_elements(html):
+    """
+    Parses HTML to find interactive elements and table data,
+    generating specific selectors for standard elements and table row actions.
+    Returns a tuple: (json_string_of_standard_elements, list_of_table_row_data)
+    """
+    # Use lxml for parsing, it's generally faster and more robust
+    soup = BeautifulSoup(html, 'lxml')
+    elements = [] # List for standard interactive elements
+    table_data = [] # List to store structured table data
+
+    # Parse standard interactive elements
+    for tag in soup.find_all(['button', 'input', 'form', 'a', 'label', 'textarea', 'select']):
+        # Skip elements that are likely within table action cells, they are handled separately
+        if tag.find_parent('td') and tag.find_parent('tr') and tag.find_parent('tbody'):
+             continue
+
+        label = (
+            tag.get_text(strip=True) or tag.get("placeholder") or
+            tag.get("aria-label") or tag.get("name") or tag.get("id") or tag.name
+        )
+        summary = {
+            "tag": tag.name,
+            "text": tag.get_text(strip=True),
+            "name": tag.get("name"),
+            "id": tag.get("id"),
+            "type": tag.get("type"),
+            "value": tag.get("value"),
+            "placeholder": tag.get("placeholder"),
+            "aria_label": tag.get("aria-label"),
+            "classes": " ".join(tag.get("class", [])),
+            "description": label,
+        }
+
+        # --- Improved Selector Generation for Inputs, Textareas, and general tags ---
+        selector_parts = []
+        if tag.get("id"):
+            selector_parts.append(f"#{tag['id']}")
+        elif tag.get("name"):
+            # Include type for inputs if name is present for better specificity
+            if tag.name == 'input' and tag.get("type"):
+                 selector_parts.append(f"{tag.name}[type='{tag['type']}'][name='{tag['name']}']")
+            # For textarea with name
+            elif tag.name == 'textarea':
+                 selector_parts.append(f"{tag.name}[name='{tag['name']}']")
+            else:
+                 selector_parts.append(f"{tag.name}[name='{tag['name']}']")
+        elif tag.get("type") and tag.name == 'input':
+             # If no id/name, but it's an input with a type, use type
+             selector_parts.append(f"{tag.name}[type='{tag['type']}']")
+        elif tag.get("placeholder"):
+             # Use a more robust attribute for placeholder if available, or just tag name
+            selector_parts.append(f"{tag.name}[placeholder*='{tag['placeholder']}']")
+        else:
+             # Add classes for better specificity if no id/name/placeholder/type
+            if tag.get("class"):
+                 selector_parts.append(f"{tag.name}.{'.'.join(tag['class'])}")
+            else:
+                 selector_parts.append(tag.name) # Fallback to just tag name
+
+        # Combine parts to form a basic selector. This might not be unique.
+        # Playwright's locators are often more robust than simple CSS selectors generated this way.
+        summary["selector"] = " ".join(selector_parts)
+
+        # Handle <select> elements and their options
+        if tag.name == "select":
+            options = []
+            for option in tag.find_all("option"):
+                option_value = option.get("value")
+                option_text = option.get_text(strip=True)
+                # Refine option selector for better specificity
+                option_selector = f"{tag.name}{summary.get('selector', '')}[value='{option_value}']" if summary.get('selector') else f"{tag.name}[value='{option_value}']"
+                options.append({
+                    "value": option_value,
+                    "text": option_text,
+                    "selector": option_selector,
+                })
+            summary["options"] = options
+
+        elements.append(summary)
+
+
+    # Add table parsing logic to find rows and action buttons within them
+    tables = soup.find_all('table')
+
+    for table in tables:
+        # Attempt to get table headers for better context for the LLM
+        headers = [th.get_text(strip=True) for th in table.select('thead th')]
+        rows = table.select('tbody tr')
+
+        for i, row in enumerate(rows):
+            row_summary = {"row_index": i}
+            cells = row.select('td')
+            row_text_data = {} # Use dictionary for key-value pairs for easier access
+            action_elements = [] # List to store action buttons/links in this row
+
+            # Generate a base selector for this specific row using nth-of-type
+            # This makes the row selector specific to its position in the tbody
+            row_base_selector = f"table tbody tr:nth-of-type({i+1})"
+            # Add table class to base selector if available for more specificity
+            if table.get("class"):
+                row_base_selector = f"table.{'.'.join(table['class'])} tbody tr:nth-of-type({i+1})"
+
+
+            for j, cell in enumerate(cells):
+                cell_text = cell.get_text(strip=True)
+                # Use header text as key if available, otherwise use column index
+                col_key = headers[j] if j < len(headers) else f"col_{j}" # Handle case where headers might be fewer than columns
+                row_text_data[col_key] = cell_text
+
+                # Find interactive elements within this cell (potential action buttons/links)
+                # Look for both button and anchor tags
+                for action_tag in cell.find_all(['button', 'a']):
+                     action_text = action_tag.get_text(strip=True)
+                     if action_text: # Only consider elements with visible text as potential actions
+                         # Generate a specific selector for this action element within this row
+                         # Use the text content and tag name for targeting within the specific row selector
+                         # Using :has-text() which is a Playwright extension and generally more reliable
+                         action_selector = f"{row_base_selector} {action_tag.name}:has-text('{action_text}')"
+                         # Add class for more specificity if available
+                         if action_tag.get("class"):
+                              action_selector = f"{row_base_selector} {action_tag.name}.{'.'.join(action_tag['class'])}:has-text('{action_text}')"
+
+
+                         action_elements.append({
+                             "tag": action_tag.name,
+                             "text": action_text,
+                             "selector": action_selector,
+                             # Create a descriptive label for the LLM
+                             "description": f"'{action_text}' button/link for row with data: {', '.join([f'{k}: {v}' for k, v in row_text_data.items()])}"
+                         })
+
+            row_summary["data"] = row_text_data
+            row_summary["actions"] = action_elements
+            table_data.append(row_summary)
+
+    # Return both standard elements (limited to 30) and the full table data
+    # The LLM will use table_data for row-specific actions
+    return json.dumps(elements[:30], indent=2), table_data
+
+def find_description(elements_list_json, table_data_list, selector):
+    """
+    Finds the description for a selector, checking both standard elements and table row actions.
+    Prioritizes table data actions if a match is found there.
+    """
+    try:
+        # Check table data actions first as they have more specific descriptions
+        for row in table_data_list:
+            for action in row.get("actions", []):
+                if action.get("selector") == selector:
+                    return action.get("description", selector)
+
+        # If not found in table data, check standard elements
+        elements = json.loads(elements_list_json)
+        for el in elements:
+            if el.get("selector") == selector:
+                return el.get("description", selector)
+
+    except Exception as e:
+        print(f"Error finding description: {e}")
+        pass
+    return selector
+
+# ========== Visual Debugging ==========
+async def highlight_element(page, selector):
+    """Highlights an element on the page with a red outline."""
+    script = f"""
+        const el = document.querySelector("{selector}");
+        if (el) {{
+            el.style.outline = '4px solid red';
+            el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+        }} else {{
+            console.warn("Element not found for highlighting:", "{selector}");
+        }}
+    """
+    try:
+        await page.evaluate(script)
+    except Exception as e:
+        print(f"[❌ Failed to highlight element '{selector}']: {e}")
+
+
+async def save_screenshot(page, step_count, selector):
+    """Saves a screenshot of the page after highlighting an element."""
+    os.makedirs("screenshots", exist_ok=True)
+    # Highlight before saving the screenshot
+    await highlight_element(page, selector)
+    filename = f"screenshots/step_{step_count}_{int(time.time())}.png"
+    try:
+        await page.screenshot(path=filename, full_page=True)
+        print(f"[🖼 Screenshot saved]: {filename}")
+    except Exception as e:
+        print(f"[❌ Failed to save screenshot]: {e}")
+
+
+# ========== Fallback Logic ==========
+async def fallback_by_text(page, text, action):
+    """
+    Attempts to find and interact with an element using text content as a fallback.
+    Note: Fallback by text might not be suitable for specific table row buttons
+    if the text is not unique on the page.
+    """
+    if not text: # Cannot fallback by text if no text is provided
+        return False
+    try:
+        # Use Playwright's text locator which is more robust
+        locator = page.get_by_text(text, exact=False).first
+        # Check if the element is visible and enabled before interacting
+        if not await locator.is_visible() or not await locator.is_enabled():
+             print(f"[⚠️ Fallback element found by text '{text}' but not visible or enabled]")
+             return False
+
+        await locator.scroll_into_view_if_needed()
+        if action == "click":
+            await locator.click()
+        elif action == "submit":
+             # Fallback submit by text might not be reliable, consider alternatives
+            await locator.press("Enter")
+        elif action == "extract":
+            content = await locator.inner_text()
+            print("\n[📄 Extracted via fallback]:", content)
+            return True # Indicate extraction success
+        print(f"[✅ Fallback success using text match]: '{text}' for action '{action}'")
+        return True
+    except Exception as e:
+        print(f"[❌ Fallback failed for text '{text}' and action '{action}']: {e}")
+        return False
+
+# ========== Citation Logic ==========
+def create_citation(action, description, value):
+    """Generates a human-readable citation for an action."""
+    if action == "type":
+        return f"Action: '{description}' Value entered: '{value}'"
+    elif action == "click":
+        return f"Action: Clicked on '{description}'"
+    elif action == "check":
+        return f"Action: Checked '{description}'"
+    elif action == "submit":
+        return f"Action: Submitted form via '{description}'"
+    elif action == "extract":
+        return f"Action: Extracted content from '{description}'"
+    elif action == "select_dropdown":
+        return f"Action: Selected value '{value}' in dropdown '{description}'"
+    return f"Action: Performed '{action}' on '{description}'"
+
+# ========== Main Automation Agent ==========
+async def run_browser_agent(instruction: str, start_url: str):
+    """
+    Runs the browser automation agent based on a natural language instruction.
+    """
+    playwright_code = [] # Stores Playwright code snippets for logging
+    citations = []  # Collect citations here
+
+    async with async_playwright() as p:
+        # Launch browser - headless=False shows the browser window
+        browser = await p.chromium.launch(headless=False, slow_mo=100)
+        page = await browser.new_page()
+        print(f"Navigating to {start_url}")
+        try:
+            await page.goto(start_url)
+            print("Navigation complete.")
+        except Exception as e:
+            print(f"[❌ Failed to navigate to {start_url}]: {e}")
+            await browser.close()
+            return # Exit if initial navigation fails
+
+
+        step = 0
+        completed_actions = [] # Keep track of actions for the LLM context
+        retries = 0
+        max_retries = 3 # Max retries for a single step or LLM call
+
+        # Define the prompt template for the LLM
+        prompt = PromptTemplate(
+            input_variables=["url", "elements", "table_data", "instruction", "completed_actions", "history"],
+            template="""
+You are an intelligent web automation agent. Your goal is to perform actions on the webpage based on the user's instruction.
+
+Current Page URL: {url}
+
+HTML Elements List (up to 30 non-table interactive elements):
+{elements}
+
+Table Data Found:
+{table_data}
+
+User's Main Instruction:
+"{instruction}"
+
+Actions Completed So Far:
+{completed_actions}
+
+Short History Memory (recent errors or key events):
+{history}
+
+Choose the next action as JSON. Respond ONLY with the JSON object.
+{{
+  "action": "click" | "type" | "submit" | "check" | "extract" | "done" | "navigate_back" | "navigate_forward" | "navigate_to" | "select_dropdown",
+  "selector": "CSS selector for the target element (required for click, type, check, submit, extract, select_dropdown, check)",
+  "text": "Text to type (if action is 'type')",
+  "value": "Value to select (if action is 'select_dropdown')",
+  "url": "URL to visit (if action is 'navigate_to')",
+  "description": "A brief, human-readable description of the action being taken (e.g., 'Click Edit for Ipad row', 'Check the Product checkbox', 'Select Product radio button', 'Type comments in Comments textarea')"
+}}
+
+Instructions for Action Selection:
+- Analyze the 'User's Main Instruction' to understand the overall goal.
+- Review the 'HTML Elements List' for general interactive elements (buttons, inputs, links, checkboxes, radio buttons, textareas, select dropdowns, etc.). Pay attention to input elements with type="checkbox" or type="radio" and textarea elements.
+- Review the 'Table Data Found' for structured information in tables, including row data and specific action buttons/links within each row.
+- If the instruction refers to interacting with a specific table row (e.g., "Click Delete for the row with Product Company is 'Samsung'", "Edit the entry for Apple"), identify the matching row in 'Table Data Found' based on the row's 'data'.
+- Find the corresponding action (e.g., 'Delete', 'Edit', 'View Details', 'Activate') within that row's 'actions' list based on the button/link text mentioned in the instruction.
+- Use the 'selector' provided for that specific action element in the chosen row as the 'selector' for the 'click' action. This selector is unique to the button/link within that particular row.
+- If the instruction requires typing text into a text input field or a textarea, find the relevant input or textarea element in the 'HTML Elements List' and use its 'selector' with the "type" action and the specified 'text'. Identify these elements by their name, id, placeholder, or associated label.
+- If the instruction requires checking a checkbox or selecting a radio button, find the relevant input element in the 'HTML Elements List' (or potentially table data if checkboxes are in a table) and use its 'selector' with the "check" action. Identify checkboxes/radio buttons by their type="checkbox" or type="radio", name, value, or associated text/label.
+- For radio buttons, the instruction might specify the value to select (e.g., "Set Type to 'Product'"). Find the radio button input with the correct 'name' attribute (for the group) and the correct 'value' attribute or associated text, and use its specific selector with the "check" action.
+- If the instruction does NOT refer to a specific table row, checkbox/radio button, or textarea, find the relevant element in the 'HTML Elements List' and use its 'selector'.
+- If the task is complete according to the instruction, set the action to "done".
+- Always provide a clear and descriptive 'description' for the action, especially for table row interactions or filling/checking elements, to make the process understandable.
+- Ensure the 'selector' is accurate and targets the intended element.
+
+Example JSON for clicking an Edit button in a table row:
+{{
+  "action": "click",
+  "selector": "table.table.table-bordered tbody tr:nth-of-type(1) button:has-text('Edit')",
+  "description": "Click Edit button for row with Product Name Ipad"
+}}
+
+Example JSON for typing in an input field:
+{{
+  "action": "type",
+  "selector": "#productNameInput",
+  "text": "New Product Name",
+  "description": "Type 'New Product Name' into Product Name field"
+}}
+
+Example JSON for clicking a general button:
+{{
+  "action": "click",
+  "selector": "button:has-text('Add Product')",
+  "description": "Click Add Product button"
+}}
+
+Example JSON for checking a checkbox:
+{{
+  "action": "check",
+  "selector": "input[type='checkbox'][name='isAvailable']",
+  "description": "Check the IsAvailable checkbox"
+}}
+
+Example JSON for selecting a radio button with a specific value:
+{{
+  "action": "check",
+  "selector": "input[type='radio'][name='productType'][value='Product']",
+  "description": "Select 'Product' radio button for Type"
+}}
+
+Example JSON for typing into a textarea:
+{{
+  "action": "type",
+  "selector": "textarea[name='Comments']",
+  "text": "Launch in Q3",
+  "description": "Type comments in Comments textarea"
+}}
+
+
+Respond only with valid JSON.
+""")
+
+        chain = prompt | llm # Create the LangChain chain
+        history = "" # Simple history string
+
+        # Main automation loop
+        while step < 30: # Limit steps to prevent infinite loops
+            print(f"\n--- Step {step} ---")
+            try:
+                html = await page.content()
+                # Parse both standard elements and table data
+                element_summaries_json, table_data_list = parse_semantic_elements(html)
+                url = page.url
+
+                # Prepare table data for the LLM prompt (using JSON dump for structure)
+                # This provides the LLM with the details of each row and its actions
+                table_data_for_prompt = json.dumps(table_data_list, indent=2)
+
+                # Invoke the LLM with the current page context and instruction
+                print("Invoking LLM to determine next action...")
+                response = await chain.ainvoke({
+                    "url": url,
+                    "elements": element_summaries_json,
+                    "table_data": table_data_for_prompt, # Pass the structured table data
+                    "instruction": instruction,
+                    "completed_actions": json.dumps(completed_actions), # Pass completed actions
+                    "history": history, # Pass simple history
+                })
+                print("[🔴 LLM Response Received]")
+
+                # Clean and parse the LLM's JSON response
+                cleaned_response = response.strip().removeprefix("```json").removesuffix("```").strip()
+                action_dict = json.loads(cleaned_response)
+                retries = 0 # Reset retries on successful LLM response parsing
+
+            except json.JSONDecodeError as e:
+                print(f"[❌ Failed to parse LLM JSON response]: {e}")
+                print(f"Raw response: {response}")
+                retries += 1
+                history += f"\n[Error parsing LLM response at step {step}]"
+                if retries > max_retries:
+                    print("[💥 Too many JSON parsing retries. Exiting.]")
+                    break
+                await page.wait_for_timeout(1000) # Wait a bit before retrying
+                continue # Skip to next loop iteration
+
+            except Exception as e:
+                 print(f"[❌ An unexpected error occurred during LLM invocation or processing]: {e}")
+                 retries += 1
+                 history += f"\n[Unexpected error at step {step}: {e}]"
+                 if retries > max_retries:
+                    print("[💥 Too many unexpected errors. Exiting.]")
+                    break
+                 await page.wait_for_timeout(1000) # Wait a bit before retrying
+                 continue # Skip to next loop iteration
+
+
+            action = action_dict.get("action")
+            selector = action_dict.get("selector")
+            text = action_dict.get("text", "")
+            value = action_dict.get("value", "")
+            nav_url = action_dict.get("url", "")
+            # Get the optional description from the LLM's response
+            action_description = action_dict.get("description", selector)
+
+
+            if action == "done":
+                print("\n[✅ Task completed by the agent as instructed]")
+                break # Exit the loop if the LLM says the task is done
+
+            # Perform the action using Playwright
+            try:
+                # For element-specific actions, ensure a selector is provided
+                if action in ["click", "type", "check", "submit", "extract", "select_dropdown"]:
+                    if not selector:
+                        print(f"[⚠️ Action '{action}' requires a selector, but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Action '{action}' missing selector at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing selector]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+                    # Save screenshot before performing the action
+                    # This will also highlight the element using the selector
+                    await save_screenshot(page, step, selector)
+
+                    # Get a descriptive text for the action for logging and citations
+                    # Use the LLM's provided description if available, otherwise try to find it
+                    desc = action_description # Prefer LLM's description
+                    if not desc or desc == selector: # If LLM didn't provide a good description
+                         # Fallback to finding description from parsed elements/table data
+                         desc = find_description(element_summaries_json, table_data_list, selector) or selector
+                         print(f"[ℹ️ Using generated description: {desc}]")
+
+
+                    # Create and store citation
+                    citation = create_citation(action, desc, value)
+                    citations.append(citation)
+                    print(f"[📜 Citation]: {citation}")
+
+                # Execute the action based on the parsed response
+                if action == "type":
+                    print(f"Typing '{text}' into element with selector '{selector}'")
+                    # Playwright's page.fill works for both input and textarea
+                    await page.fill(selector, text)
+                    playwright_code.append(f"await page.fill('{selector}', '{text}')")
+                    completed_actions.append(f"Typed '{text}' in '{desc}'")
+
+                elif action == "click":
+                    print(f"Clicking element with selector '{selector}'")
+                    await page.click(selector)
+                    playwright_code.append(f"await page.click('{selector}')")
+                    completed_actions.append(f"Clicked on '{desc}'")
+
+                elif action == "submit":
+                    print(f"Submitting via element with selector '{selector}'")
+                    # Using locator().press('Enter') is a common way to submit a form element
+                    await page.locator(selector).press("Enter")
+                    playwright_code.append(f"await page.locator('{selector}').press('Enter')")
+                    completed_actions.append(f"Submitted form via '{desc}'")
+
+                elif action == "check":
+                    print(f"Checking element with selector '{selector}'")
+                    # Use page.locator(selector).check() for checkboxes/radio buttons
+                    await page.locator(selector).check()
+                    playwright_code.append(f"await page.locator('{selector}').check()")
+                    completed_actions.append(f"Checked '{desc}'")
+
+                elif action == "extract":
+                    print(f"Extracting text from element with selector '{selector}'")
+                    content = await page.inner_text(selector)
+                    playwright_code.append(f"await page.inner_text('{selector}')")
+                    completed_actions.append(f"Extracted from '{desc}': {content}")
+                    print(f"Extracted: {content}")
+                    break # Stop after extracting as per typical requirements
+
+                elif action == "select_dropdown":
+                    print(f"Selecting value '{value}' in dropdown with selector '{selector}'")
+                    if value:
+                        await page.select_option(selector, value=value)
+                        playwright_code.append(f"await page.select_option('{selector}', value='{value}')")
+                        completed_actions.append(f"Selected '{value}' in dropdown '{desc}'")
+                    else:
+                        print("[⚠️ Missing dropdown value for 'select_dropdown' action. Retrying...]")
+                        retries += 1
+                        history += f"\n[Select dropdown missing value at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing dropdown value]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+
+                elif action == "navigate_back":
+                    print("Navigating back")
+                    await page.go_back()
+                    playwright_code.append("await page.go_back()")
+                    completed_actions.append("Navigated back")
+
+                elif action == "navigate_forward":
+                    print("Navigating forward")
+                    await page.go_forward()
+                    playwright_code.append("await page.go_forward()")
+                    completed_actions.append("Navigated forward")
+
+                elif action == "navigate_to":
+                    if nav_url:
+                        print(f"Navigating to URL: {nav_url}")
+                        await page.goto(nav_url)
+                        playwright_code.append(f"await page.goto('{nav_url}')")
+                        completed_actions.append(f"Navigated to {nav_url}")
+                    else:
+                        print("[⚠️ 'navigate_to' action requires a 'url', but none was provided. Retrying...]")
+                        retries += 1
+                        history += f"\n[Navigate_to missing URL at step {step}]"
+                        if retries > max_retries:
+                            print("[💥 Exiting after max retries for missing navigation URL]")
+                            break
+                        await page.wait_for_timeout(1000)
+                        continue # Skip to next loop iteration
+
+
+                else:
+                    print(f"[⚠️ Unknown action received from LLM: {action}]")
+                    retries += 1
+                    history += f"\n[Unknown action '{action}' at step {step}]"
+                    if retries > max_retries:
+                        print("[💥 Exiting after max retries for unknown action]")
+                        break
+                    await page.wait_for_timeout(1000)
+                    continue # Skip to next loop iteration
+
+                # If action was successful, increment step and reset retries
+                step += 1
+                retries = 0
+                # Add a small wait after successful action
+                await page.wait_for_timeout(1500)
+
+            except Exception as e:
+                # Handle exceptions during Playwright action execution
+                print(f"[⚠️ Action failed for selector '{selector}']: {e}")
+                # Attempt fallback logic if applicable (currently only for click/submit/extract by text)
+                # Note: Fallback by text might not be suitable for specific table row buttons
+                # Consider if a more specific fallback is needed for table actions.
+                # Fallback text could be the button text or the row data text
+                fallback_text_attempt = action_dict.get("text") or action_description # Try LLM text/description first
+                if not fallback_text_attempt and selector: # If no LLM text/desc, try to get text from selector
+                     # This is a very basic attempt and might not work for complex selectors
+                     try:
+                          fallback_text_attempt = await page.inner_text(selector)
+                     except:
+                          pass # Ignore error if cannot get text from selector
+
+
+                fallback_success = False
+                if fallback_text_attempt:
+                     print(f"[ℹ️ Attempting fallback for text: '{fallback_text_attempt}']")
+                     fallback_success = await fallback_by_text(page, fallback_text_attempt, action)
+
+
+                if not fallback_success:
+                    retries += 1
+                    history += f"\n[Error executing {action} on {selector} at step {step}]"
+                    print(f"[🔄 Retrying step {step}. Retry count: {retries}/{max_retries}]")
+                    if retries > max_retries:
+                        print("[💥 Exiting after max retries for action failure]")
+                        break
+                    await page.wait_for_timeout(1000) # Wait before retrying
+
+        # End of while loop
+
+        print("\n\n============== PLAYWRIGHT CODE ==============")
+        for idx, code in enumerate(playwright_code, 1):
+            print(f"{idx}. await {code}") # Added await for clarity
+        print("============== END CODE ==============")
+
+        print("\n\n============== CITATIONS ==============")
+        for idx, citation in enumerate(citations, 1):
+            print(f"{idx}. {citation}")
+        print("============== END CITATIONS ==============")
+
+        await browser.close()
+        print("Browser closed.")
+
+# CLI Entry Point
+# ========== CLI Entrypoint ==========
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=False, help="URL of the page to automate.")
+    parser.add_argument("--instruction", required=False, help="Instruction for the browser automation.")
+    args = parser.parse_args()
+
+    # Default instruction if none is provided via CLI argument
+    # Example instruction for table interaction:
+    # instruction = """
+    # Click the 'Delete' button for the row where Product Company is 'Samsung'.
+    # """
+    # Another example:
+    # instruction = """
+    # Click the 'Edit' button for the row with Product Name 'Ipad'.
+    # """
+    # Example for adding a product, checking a checkbox, selecting a radio button, and filling a textarea:
+    # instruction = """
+    # Click on Add product button and
+    # Add a new product with the following details:
+    # - Product Name: "New Gadget"
+    # - Product Company: "Innovate Corp"
+    # - IsAvailable: "false"
+    # - Type: "Accessory"
+    # - Country: "UK"
+    # - Comments: "Launch in Q3"
+    # Check the checkbox for 'IsAvailable'.
+    # Set Type to 'Product'.
+    # Click on the "Save" button.
+    # """
+
+    instruction =  """
+        Click on Add product button and 
+        Add a new product with the following details:
+        - Product Name: "Tab 9S"
+        - Product Company: "Samsung"
+        - IsAvailable: "true"
+        - Type: "Part"
+        - Country: "Germany"
+        - Comments: "Need it by next week" Click on the "Save" button  
+        Click the 'Edit' button for the row where Product Name is 'Tab 9S'.
+        Then Fill out the form with Name: 'Laptop', Company: 'Dell', IsAvailable: 'true', Type: 'Part', Country: 'UK', Comments: 'Urgent delivery' 
+        Click the 'Save' button 
+        and Click on Add product button .
+        """
+
+
+    # If no URL is provided, use the default URL
+    url = args.url or "http://localhost:5188/product" # Replace with your actual URL if different
+
+    # If no instruction is provided via CLI, use the default instruction defined above
+    instruction = args.instruction or instruction
+
+    print(f"Starting automation with URL: {url}")
+    print(f"Instruction: {instruction}")
+
+    # Run the browser automation with the provided URL and instruction
+    asyncio.run(run_browser_agent(instruction, url))
+
