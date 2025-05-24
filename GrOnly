@@ -1,0 +1,729 @@
+import os
+import json
+import asyncio
+import re
+from playwright.async_api import async_playwright
+from langchain_google_genai import ChatGoogleGenerativeAI
+from bs4 import BeautifulSoup
+
+# Ensure you have your Google API Key set as an environment variable
+# or replace "YOUR_GEMINI_API_KEY" with your actual key.
+# It's recommended to set it as an environment variable for security.
+os.environ["GOOGLE_API_KEY"] = "AIzaSyBHeipg4_mgEsAPdM1U_gUzPtGLg6jg7oY"
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+
+def prompt_to_plan(user_prompt):
+    """
+    Uses an LLM to convert a natural language user prompt into a structured JSON plan of actions.
+    """
+    system_prompt = """
+You are an AI agent that interprets grid/table automation commands.
+Produce a JSON list of actions for adding, editing, deleting, batch operations, undo, redo.
+Always prefer explicit field names from the prompt.
+Support batch/conditional operations: (add three rows..., delete all where Units In Stock < 10, etc.).
+If the user says 'undo' or 'undo last change', return [{"action": "undo"}].
+If the user says 'redo', return [{"action": "redo"}].
+Return a JSON list of actions, e.g.:
+[
+  {"action": "add", "data": {"Product Name": "New Item", "Unit Price": 25}},
+  {"action": "edit", "where": {"Product Name": "Chai"}, "data": {"Unit Price": 20.5}},
+  {"action": "delete", "where": {"Units In Stock": {"$lt": 10}}},
+  {"action": "undo"},
+  {"action": "redo"}
+]
+No explanation, only valid JSON. Use correct types (numbers, booleans, strings).
+"""
+    if not user_prompt or not user_prompt.strip():
+        print("[ERROR] No user prompt provided for plan generation!")
+        return []
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+    result = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ])
+    return result
+
+
+def extract_json_from_llm_response(plan_raw):
+    """
+    Extracts a JSON string from the LLM's response, handling markdown code blocks.
+    """
+    if hasattr(plan_raw, "content"):
+        plan_raw = plan_raw.content
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", plan_raw, re.DOTALL)
+    if match:
+        return match.group(1)
+    return plan_raw.strip()
+
+
+def summarize_action(actions, result_info):
+    """
+    Uses an LLM to summarize the performed actions for the user.
+    """
+    system_prompt = "Summarize the grid actions for the user, using clear, concise English."
+    user_prompt = f"Actions performed: {json.dumps(actions)}. Results: {json.dumps(result_info)}"
+    if not actions:
+        return "No actions performed."
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+    result = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ])
+    if hasattr(result, "content"):
+        return result.content.strip()
+    return str(result).strip()
+
+
+def parse_filter(cell_text, filter_obj):
+    """
+    Parses filter conditions (e.g., $lt, $gte) for numerical comparisons.
+    """
+    for op, val in filter_obj.items():
+        try:
+            cell_val = float(cell_text)
+            val = float(val)
+        except ValueError:  # Catch conversion errors for non-numeric comparisons
+            cell_val = cell_text
+
+        # Perform comparisons
+        if op == "$lt" and not (cell_val < val): return False
+        if op == "$lte" and not (cell_val <= val): return False
+        if op == "$gt" and not (cell_val > val): return False
+        if op == "$gte" and not (cell_val >= val): return False
+        if op == "$eq" and not (cell_val == val): return False
+        if op == "$ne" and not (cell_val != val): return False
+    return True
+
+
+async def ask_llm_for_selector(task, html_snippet, user_prompt=None):
+    """
+    Uses an LLM to find the best Playwright selector for a given task and HTML snippet.
+    """
+    # Defensive: skip LLM if input is empty
+    if not task or not html_snippet or not str(html_snippet).strip():
+        print(
+            f"[WARN] Skipping selector generation: missing task or HTML. Task: '{task}', HTML: '{str(html_snippet)[:80]}...'")
+        return None
+
+    system_message_content = f"""
+You are an expert DOM automation AI.
+Given a DOM HTML snippet, return only the best **standard CSS selector** or **Playwright locator** to accomplish the following task (e.g. click a button, fill a field).
+When matching text, **prefer Playwright's `text=` or `has-text=` locators** over non-standard pseudo-classes like `:contains()`.
+Ensure the selector targets the *active* or *currently visible* element if there are multiple similar elements.
+
+Task: {task}
+HTML:
+{html_snippet}
+
+ONLY output the selector, NO explanation.
+"""
+    messages = [
+        {"role": "system", "content": system_message_content}
+    ]
+
+    if user_prompt:
+        messages.append({"role": "user",
+                         "content": f"The user's specific command was: {user_prompt}. Please find the selector based on the task and HTML provided."})
+    else:
+        messages.append({"role": "user", "content": "Generate the best selector based on the provided task and HTML."})
+
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+
+    try:
+        result = llm.invoke(messages)
+    except Exception as e:
+        print(
+            f"[ERROR] LLM invocation failed for selector generation. Task: '{task}', HTML Snippet (first 100 chars): '{str(html_snippet)[:100]}...'. Error: {e}")
+        return None
+
+    selector = str(result.content if hasattr(result, "content") else result).strip()
+    selector = re.sub(r"^`+|`+$", "", selector)  # Remove leading/trailing backticks
+    selector = selector.replace("```", "").strip()  # Remove triple backticks if any
+    if not selector:
+        print("[WARN] Selector not returned by LLM.")
+        return None
+    return selector
+
+
+async def get_soup(element):
+    """
+    Retrieves the inner HTML of a Playwright element and parses it with BeautifulSoup.
+    """
+    try:
+        html = await element.inner_html()
+        if not html or not html.strip():
+            print("[WARN] Could not get inner_html (empty).")
+            return None
+    except Exception as ex:
+        print(f"[ERROR] Unable to get inner_html: {ex}")
+        return None
+    return BeautifulSoup(html, "html.parser")
+
+
+async def get_table_headers(grid_element):
+    """
+    Extracts table headers from the grid element.
+    """
+    soup = await get_soup(grid_element)
+    if not soup:
+        print("[WARN] No headers found (soup was empty).")
+        return []
+    ths = soup.select("thead th")
+    return [th.get_text(strip=True) for th in ths]
+
+
+async def get_rows(grid_element):
+    """
+    Extracts all table rows from the grid element.
+    """
+    soup = await get_soup(grid_element)
+    if not soup:
+        print("[WARN] No rows found (soup was empty).")
+        return []
+    return soup.select("tbody tr")
+
+
+async def get_row_data(grid_element, row_index):
+    """
+    Retrieves data for a specific row index based on table headers.
+    """
+    soup = await get_soup(grid_element)
+    if not soup:
+        print("[WARN] Soup empty while getting row data.")
+        return {}
+    rows = soup.select("tbody tr")
+    if row_index >= len(rows):
+        print(f"[WARN] Row index {row_index} out of range.")
+        return {}
+    row = rows[row_index]
+    cells = row.find_all("td")
+    headers = [th.get_text(strip=True) for th in soup.select("thead th")]
+    return {headers[i]: cells[i].get_text(strip=True) for i in range(min(len(headers), len(cells)))}
+
+
+async def find_row_indices_by_filter(grid_element, header, filter_value):
+    """
+    Finds row indices that match a given header and filter value/condition.
+    """
+    headers = await get_table_headers(grid_element)
+    col_idx = None
+    for i, h in enumerate(headers):
+        if h == header:
+            col_idx = i
+            break
+    if col_idx is None:
+        print(f"[WARN] Column '{header}' not found in headers: {headers}")
+        return []
+    rows = await get_rows(grid_element)
+    indices = []
+    for i, row in enumerate(rows):
+        cells = row.find_all("td")
+        if col_idx < len(cells):
+            cell_val = cells[col_idx].get_text(strip=True)
+            if isinstance(filter_value, dict):  # Handle complex filters like {"$lt": 10}
+                if parse_filter(cell_val, filter_value):
+                    indices.append(i)
+            else:  # Handle direct string matching
+                if cell_val == str(filter_value):
+                    indices.append(i)
+    return indices
+
+
+async def highlight_element(page, locator):
+    """
+    Highlights a Playwright element on the page for visual debugging.
+    """
+    try:
+        # Give a short timeout for highlighting, as the element might disappear quickly after interaction
+        await locator.evaluate(
+            """element => {
+                element.style.border = "2px solid red";
+                element.style.boxShadow = "0 0 10px 2px red";
+            }""", timeout=2000  # Shorter timeout for highlighting
+        )
+    except Exception as ex:
+        print(f"[WARN] Could not highlight element: {ex}")
+
+
+# Main Grid Driver
+class AIVisionGridDriver:
+    """
+    Automates interactions with a web grid/table using Playwright and LLM-driven selectors.
+    """
+
+    def __init__(self, page, grid_root):
+        self.page = page
+        self.grid_root = grid_root
+
+    async def get_header_indices(self):
+        # This function correctly returns a dictionary mapping header name to its index
+        headers = await get_table_headers(
+            self.grid_root)  # headers will be a list like ['Product Name', 'Unit Price', ...]
+        return {h: i for i, h in
+                enumerate(headers)}  # This correctly converts it to a dict: {'Product Name': 0, 'Unit Price': 1, ...}
+
+    async def get_row_data(self, row_index):
+        return await get_row_data(self.grid_root, row_index)
+
+    async def add_row(self, value_map, user_prompt=None):
+        """Adds a new row to the grid and fills specified fields."""
+        grid_html = await self.grid_root.inner_html()
+        add_btn_selector = await ask_llm_for_selector("Find the add/new row button for this grid.", grid_html,
+                                                      user_prompt)
+        if not add_btn_selector:
+            print("[ERROR] No add button selector returned.")
+            return
+        add_btn = self.grid_root.locator(add_btn_selector)
+        if await add_btn.count() == 0:
+            print("[ERROR] Add button not found on grid.")
+            return
+        await add_btn.click()
+        await self.page.wait_for_timeout(500)  # Small pause for UI reaction
+
+        # When adding a row, the new editable row should have the k-grid-edit-row class
+        # We explicitly guide the LLM to look for this class
+        editable_row_selector = "tr.k-grid-edit-row"  # This is a common selector for editable rows in Kendo UI
+        edit_row = self.grid_root.locator(editable_row_selector)
+
+        try:
+            await edit_row.wait_for(state='visible',
+                                    timeout=10000)  # Wait for the editable row to appear and be visible
+        except Exception as e:
+            print(f"[ERROR] Editable row (expected class 'k-grid-edit-row') not found or visible after add click: {e}")
+            return
+
+        header_indices = await self.get_header_indices()
+        if not isinstance(header_indices, dict):
+            print(
+                f"[CRITICAL ERROR] Expected header_indices to be a dictionary, but got type {type(header_indices)}. Please ensure get_header_indices function returns a dict.")
+            return
+
+        for header, value in value_map.items():
+            # Skip non-editable or action button fields
+            if not header or value in (
+            "EditRemoveUpdateCancel", "Update", "Cancel"):  # Add more known non-fillable texts if needed
+                print(f"[INFO] Skipping non-fillable field: '{header}' with value '{value}'")
+                continue
+
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                print(f"[WARN] Header '{header}' not found.")
+                continue
+
+            cell = edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()  # Get HTML of the cell for LLM
+            except Exception as e:
+                print(f"[ERROR] Could not get HTML for cell '{header}': {e}. Skipping field.")
+                continue
+
+            if not cell_html or not cell_html.strip():
+                print(f"[WARN] Empty cell HTML for field '{header}'. Skipping.")
+                continue
+
+            input_selector = await ask_llm_for_selector(f"Find the input/editor for field '{header}'", cell_html,
+                                                        user_prompt)
+            if not input_selector:
+                print(f"[ERROR] No selector for field '{header}'")
+                continue
+            input_elem = cell.locator(input_selector)  # Locate input within the cell
+
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    print(
+                        f"Attempting to fill field '{header}' (tag: {tag}, selector: {input_selector}) with value: '{value}'")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))  # Playwright's fill handles 'editable' state
+                    print(f"Successfully filled field '{header}'.")
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    print(f"[ERROR] Could not fill field '{header}': {ex}")
+
+        editable_row_current_html = await edit_row.inner_html()
+        save_btn_selector = await ask_llm_for_selector("Find the save/add/update button for this new row.",
+                                                       editable_row_current_html, user_prompt)
+        if not save_btn_selector:
+            print("[ERROR] No save button selector returned for add.")
+            return
+
+        save_btn = edit_row.locator(save_btn_selector)
+
+        if await save_btn.count() > 0:
+            print(f"Waiting for save button: {save_btn_selector}")
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()  # Playwright's click has built-in waits for enabled/stable
+                print("Successfully clicked save button.")
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                print(f"[ERROR] Failed to click save button during add: {e}")
+                print(f"Selector used: {save_btn_selector}")
+
+    async def edit_row(self, row_index, value_map, user_prompt=None):
+        """Edits an existing row in the grid by index and fills specified fields."""
+        # Find the specific row to click its edit button.
+        row_elem = self.grid_root.locator(f'tbody tr').nth(row_index)
+
+        try:
+            await row_elem.wait_for(state='attached', timeout=5000)
+            await row_elem.wait_for(state='visible', timeout=5000)
+            row_html = await row_elem.inner_html()  # Get HTML of the specific row for LLM
+        except Exception as e:
+            print(f"[ERROR] Could not get HTML for row {row_index} for edit: {e}. Skipping row.")
+            return
+
+        if not row_html or not row_html.strip():
+            print("[WARN] Empty row HTML for edit.")
+            return
+
+        edit_btn_selector = await ask_llm_for_selector("Find the edit button for this row.", row_html, user_prompt)
+        if not edit_btn_selector:
+            print("[ERROR] No edit button selector returned.")
+            return
+
+        edit_btn = row_elem.locator(edit_btn_selector)  # Locate edit button within the row
+        if await edit_btn.count() > 0:
+            print(f"Clicking edit button for row {row_index} with selector: {edit_btn_selector}")
+            await edit_btn.click()
+        else:
+            print(f"[WARN] Edit button not found for row {row_index} with selector: {edit_btn_selector}")
+            return  # Cannot proceed if edit button isn't found
+
+        await self.page.wait_for_timeout(500)  # Small pause for UI to react
+
+        # CRITICAL FIX: Explicitly specify the selector for the editable row.
+        # This is typically 'tr.k-grid-edit-row' for Kendo UI.
+        editable_row_selector = "tr.k-grid-edit-row"
+        edit_row = self.grid_root.locator(editable_row_selector)
+
+        try:
+            await edit_row.wait_for(state='visible',
+                                    timeout=10000)  # Wait for the editable row to appear and be visible
+        except Exception as e:
+            print(
+                f"[ERROR] Editable row with selector '{editable_row_selector}' not found or visible after edit click: {e}")
+            return
+        print(f"Editable row found with selector: {editable_row_selector}")
+
+        header_indices = await self.get_header_indices()
+        if not isinstance(header_indices, dict):
+            print(
+                f"[CRITICAL ERROR] Expected header_indices to be a dictionary, but got type {type(header_indices)}. Please ensure get_header_indices function returns a dict.")
+            return
+
+        for header, value in value_map.items():
+            # Skip non-editable or action button fields
+            if not header or value in (
+            "EditRemoveUpdateCancel", "Update", "Cancel"):  # Add more known non-fillable texts if needed
+                print(f"[INFO] Skipping non-fillable field: '{header}' with value '{value}'")
+                continue
+
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                print(f"[WARN] Header '{header}' not found.")
+                continue
+
+            cell = edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()  # Get HTML of the cell for LLM
+            except Exception as e:
+                print(f"[ERROR] Could not get HTML for cell '{header}': {e}. Skipping field.")
+                continue
+
+            if not cell_html or not cell_html.strip():
+                print(f"[WARN] Empty cell HTML for field '{header}'. Skipping.")
+                continue
+
+            # Here, the LLM is asked to find the input within the specific cell HTML
+            input_selector = await ask_llm_for_selector(
+                f"Find the input/editor for field '{header}' within this cell HTML. This should be an input or checkbox.",
+                cell_html, user_prompt)
+            if not input_selector:
+                print(f"[ERROR] No selector for field '{header}'")
+                continue
+            input_elem = cell.locator(input_selector)  # Locate input within the cell
+
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    print(
+                        f"Attempting to fill field '{header}' (tag: {tag}, selector: {input_selector}) with value: '{value}'")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))  # Playwright's fill handles 'editable' state
+                    print(f"Successfully filled field '{header}'.")
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    print(f"[ERROR] Could not fill field '{header}': {ex}")
+
+        editable_row_current_html = await edit_row.inner_html()
+        save_btn_selector = await ask_llm_for_selector("Find the save/update button for this currently editable row.",
+                                                       editable_row_current_html, user_prompt)
+        if not save_btn_selector:
+            print("[ERROR] No save button selector returned for edit.")
+            return
+
+        save_btn = edit_row.locator(save_btn_selector)
+
+        if await save_btn.count() > 0:
+            print(f"Waiting for save button: {save_btn_selector}")
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()  # Playwright's click has built-in waits for enabled/stable
+                print("Successfully clicked save button.")
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                print(f"[ERROR] Failed to click save button: {e}")
+                print(f"Selector used: {save_btn_selector}")
+        else:
+            print(f"[WARN] Save button not found for selector: {save_btn_selector}")
+
+    async def delete_row(self, row_index, user_prompt=None):
+        """Deletes a row from the grid by index."""
+        rows_soup = await get_rows(self.grid_root)
+        if row_index >= len(rows_soup):
+            print("[ERROR] Row out of range for deletion.")
+            return
+
+        row_elem = self.grid_root.locator(f'tbody tr').nth(row_index)
+
+        try:
+            await row_elem.wait_for(state='attached', timeout=5000)
+            await row_elem.wait_for(state='visible', timeout=5000)
+            row_html = await row_elem.inner_html()  # Get HTML of the specific row for LLM
+        except Exception as e:
+            print(f"[ERROR] Could not get HTML for row {row_index} for delete: {e}. Skipping row.")
+            return
+
+        if not row_html or not row_html.strip():
+            print("[WARN] Empty row HTML for delete.")
+            return
+
+        del_btn_selector = await ask_llm_for_selector("Find the delete/remove button for this row.", row_html,
+                                                      user_prompt)
+        if not del_btn_selector:
+            print("[ERROR] No delete button selector returned.")
+            return
+
+        del_btn = row_elem.locator(del_btn_selector)  # Locate delete button within the row
+        if await del_btn.count() > 0:
+            await highlight_element(self.page, del_btn)
+            await del_btn.click()
+        else:
+            print(f"[WARN] Delete button not found for row {row_index} with selector: {del_btn_selector}")
+
+    async def find_row_indices_by_filter(self, header, filter_value):
+        """Wrapper for finding row indices based on filter."""
+        return await find_row_indices_by_filter(self.grid_root, header, filter_value)
+
+    async def dispatch_actions(self, actions, undo_stack, redo_stack, user_prompt=None):
+        """Dispatches a list of actions (add, edit, delete, undo, redo)."""
+        results = []
+        for action in actions:
+            # Handle undo/redo actions first
+            if action.get("action") == "undo":
+                if not undo_stack:
+                    print("Nothing to undo.")
+                    continue
+                last_action = undo_stack.pop()
+                await self.execute_undo(last_action)
+                redo_stack.append(last_action)  # Add to redo stack after undo
+                print("Undo complete.")
+                continue
+            if action.get("action") == "redo":
+                if not redo_stack:
+                    print("Nothing to redo.")
+                    continue
+                next_action = redo_stack.pop()
+                # Re-dispatch the original action for redo
+                await self.dispatch_actions([next_action["redo_action"]], undo_stack, redo_stack, user_prompt)
+                print("Redo complete.")
+                continue
+
+            # Clear redo stack if a new action is performed (not undo/redo)
+            redo_stack.clear()
+
+            if action["action"] == "add":
+                count = int(action.get("count", 1))
+                for i in range(count):
+                    await self.add_row(action["data"], user_prompt)
+                    # For undoing an add, we need to delete the last added row
+                    rows_after_add = await get_rows(self.grid_root)
+                    row_idx_added = len(rows_after_add) - 1  # Assuming row is added at the end
+                    undo_stack.append({
+                        "action": "delete", "row_index": row_idx_added, "before_data": action["data"],
+                        "undo_type": "add",
+                        "redo_action": action  # Store original action for redo
+                    })
+                    results.append({"action": "add", "row": action["data"]})
+
+            elif action["action"] == "edit":
+                where = action["where"]
+                key, value = next(iter(where.items()))  # Get the key and value to filter by
+
+                # Fetch indices of rows that match the criteria *before* editing
+                # These indices refer to the rows in their current non-edited state.
+                indices_to_edit = await self.find_row_indices_by_filter(key, value)
+
+                if not indices_to_edit:
+                    print(f"[WARN] No rows found matching filter '{key}' = '{value}' for edit.")
+
+                # It's crucial to iterate and edit each row individually.
+                # Do NOT re-fetch the entire grid structure or re-run `find_row_indices_by_filter`
+                # within this loop unless the grid fundamentally changes its row ordering on edit.
+                # For inline editing, the original row index generally remains stable.
+                for idx in indices_to_edit:
+                    # Before each edit, get the current data of this specific row using its original index.
+                    before_data = await self.get_row_data(idx)
+                    await self.edit_row(idx, action["data"], user_prompt)
+                    undo_stack.append({
+                        "action": "edit", "row_index": idx, "before_data": before_data, "undo_type": "edit",
+                        "redo_action": action  # Store original action for redo
+                    })
+                results.append(
+                    {"action": "edit", "where": where, "count": len(indices_to_edit), "data": action["data"]})
+
+            elif action["action"] == "delete":
+                where = action["where"]
+                key, value = next(iter(where.items()))
+                # Sort indices in reverse to avoid shifting issues when deleting multiple rows
+                indices = sorted(await self.find_row_indices_by_filter(key, value), reverse=True)
+                if not indices:
+                    print(f"[WARN] No rows found matching filter '{key}' = '{value}' for delete.")
+                for idx in indices:
+                    before_data = await self.get_row_data(idx)  # Get data before delete for undo
+                    await self.delete_row(idx, user_prompt)
+                    # For undoing a delete, we need to add the row back
+                    undo_stack.append({
+                        "action": "add", "row_index": idx, "before_data": before_data, "undo_type": "delete",
+                        "redo_action": action  # Store original action for redo
+                    })
+                results.append({"action": "delete", "where": where, "count": len(indices)})
+            else:
+                print(f"Unknown action: {action}")
+        summary = summarize_action(actions, results)
+        print("\n🔎 AI Summary:\n", summary)
+
+    async def execute_undo(self, undo_action):
+        """Executes an undo operation based on the recorded action."""
+        if undo_action["undo_type"] == "add":  # If previous action was 'add', undo by deleting
+            print(f"Undoing: Deleting row at index {undo_action['row_index']}")
+            await self.delete_row(undo_action["row_index"])
+        elif undo_action["undo_type"] == "delete":  # If previous action was 'delete', undo by adding
+            print(f"Undoing: Adding row with data {undo_action['before_data']}")
+            # Filter out non-fillable fields when adding back
+            data_to_add = {k: v for k, v in undo_action["before_data"].items() if
+                           k and v not in ("EditRemoveUpdateCancel", "Update", "Cancel")}
+            await self.add_row(data_to_add)
+        elif undo_action["undo_type"] == "edit":  # If previous action was 'edit', undo by restoring old data
+            print(f"Undoing: Editing row at index {undo_action['row_index']} to restore {undo_action['before_data']}")
+            # Filter out non-fillable fields when restoring
+            data_to_restore = {k: v for k, v in undo_action["before_data"].items() if
+                               k and v not in ("EditRemoveUpdateCancel", "Update", "Cancel")}
+            await self.edit_row(undo_action["row_index"], data_to_restore)
+
+
+# --- Entrypoint ---
+async def grid_agent_main():
+    """Main function to run the AI Grid Automation agent."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)  # Set to True for headless mode
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        url = input("Paste your grid/table URL: ").strip()
+        if not url:
+            print("[ERROR] No URL provided. Exiting.")
+            return
+
+        print(f"Navigating to: {url}")
+        try:
+            # Increased timeout for page navigation and waiting for network idle
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_load_state('networkidle')
+        except Exception as e:
+            print(f"[ERROR] Could not navigate to URL or page did not load: {e}")
+            await context.close()
+            await browser.close()
+            return
+
+        print("Page loaded. Detecting grid...")
+        grid = None
+        # Try to find common Kendo UI grid selector
+        if await page.locator("kendo-grid").count():
+            grid = page.locator("kendo-grid").first
+
+        # Fallback to generic table if Kendo grid not found
+        if not grid or not await grid.count():
+            tables = page.locator("table:has(thead):has(tbody)")
+            if await tables.count() > 0:
+                grid = tables.first
+
+        if not grid or not await grid.count():
+            print("No data grid/table found on this page. Please ensure the URL contains a grid.")
+            await context.close()
+            await browser.close()
+            return
+
+        print("Grid detected. Initializing driver...")
+        driver = AIVisionGridDriver(page, grid)
+        undo_stack, redo_stack = [], []
+
+        print("\nEnter grid commands (type 'exit' to quit, 'undo' or 'redo' for history):")
+        while True:
+            user_prompt = input("> ")
+            if user_prompt.strip().lower() in ("exit", "quit"):
+                print("Exiting grid automation.")
+                break
+
+            print(f"Processing command: '{user_prompt}'")
+            plan_raw = prompt_to_plan(user_prompt)
+            plan_str = extract_json_from_llm_response(plan_raw)
+            try:
+                actions = json.loads(plan_str)
+                if not isinstance(actions, list):
+                    raise ValueError("LLM response is not a JSON list.")
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"[ERROR] Could not parse LLM response as valid JSON list: {e}")
+                print("Raw LLM response:", plan_raw)
+                continue
+
+            await driver.dispatch_actions(actions, undo_stack, redo_stack, user_prompt)
+
+        input("\nPress Enter to close the browser...")
+        await context.close()
+        await browser.close()
+
+#Edit row where Product Name is Chai,Set Product Name to Test Product Name, set Price to 77, Discontinued to true
+#Delete row where Product Name is Chang
+#Undo
+#Edit all rows where Units In Stock < 100, set Discontinued to false
+#Add row: Product Name Test, Price 10, Units In Stock 5, Discontinued false
+if __name__ == "__main__":
+    asyncio.run(grid_agent_main())
