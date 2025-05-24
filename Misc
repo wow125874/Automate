@@ -1,0 +1,30 @@
+
+aiautomationtester@gmail.com : Password@123
+
+Edit third row, set subject to AI Meeting, set priority to High and click on save
+
+
+
+Edit row where Product Name is Chai,Set Product Name to Bhai log, set Price to 77, Discontinued to true
+
+Delete row where Product Name is Chang
+
+Edit all rows where Units In Stock < 100, set Discontinued to false
+
+https://demos.telerik.com/kendo-angular-ui/demos/grid/editing/inline-editing?theme=default-purple
+
+Treelist:
+
+For the row where "First Name" is "Daryl", click the SVG icon that has the class "k-treelist-toggle"
+-> more precise ==> 1.For the row where "First Name" is "Daryl", click the caret icon to expand/collapse
+child expand ==> 
+1.For the row where "First Name" is "Guy" and its parent's "First Name" is "Daryl", click the caret icon that has a class indicating it's a "caret-alt-right" or "caret-alt-down" icon.
+
+2.For the row where "First Name" is "Guy" and its parent's "First Name" is "Daryl", click the second caret icon in its row
+
+3.add a row with "First Name" as "New Employee", "Last Name" as "Smith", and "Position" as "Analyst" and click on add/save button
+4.add a child row to "Daryl" with "First Name" as "John", "Last Name" as "Doe", and "Position" as "Team Lead"
+5.In the editable row where the original "First Name" was "Hunter" and its parent's "First Name" is "Daryl", change the "First Name" field to "Robert" and then click the "Save" button in that row. For the row where "First Name" is "Daryl", click the caret icon to expand/collapse
+
+
+<kendo-textbox kendotreelistfocusable="" dir="ltr" class="k-textbox k-input ng-untouched ng-pristine ng-valid k-input-md k-rounded-md k-input-solid k-focus"><!----><!----><!----><input class="k-input-inner" id="k-444159bb-69d0-4aa0-bc0f-8a1bb5911975" tabindex="0" type="text" aria-invalid="false"><!----><!----><!----><!----><!----><!----><!----></kendo-textbox>
