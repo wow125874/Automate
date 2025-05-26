@@ -1,0 +1,902 @@
+#Use this as latest code test all scenarios
+#pip install playwright langchain-google-genai beautifulsoup4
+#playwright install
+
+
+import os
+import sys
+import io
+import json
+import asyncio
+import re
+from playwright.async_api import async_playwright
+from langchain_google_genai import ChatGoogleGenerativeAI
+from bs4 import BeautifulSoup
+
+os.environ["GOOGLE_API_KEY"] = "KEYHERE"
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+def filter_editable_fields(data_dict):
+    IGNORE = {"", "EditRemoveUpdateCancel", "Update", "Cancel", None}
+    return {k: v for k, v in data_dict.items() if k and k not in IGNORE}
+
+def prompt_to_plan(user_prompt, treelist=False):
+    system_prompt = """
+You are an AI agent that interprets grid/table{extra}/treelist automation commands.
+Produce a JSON list of actions for adding, editing, deleting, batch operations, undo, redo{extra2}.
+Always prefer explicit field names from the prompt.
+Support batch/conditional operations: (add three rows..., delete all where Units In Stock < 10, etc.).
+If the user says 'undo' or 'undo last change', return [{{"action": "undo"}}].
+If the user says 'redo', return [{{"action": "redo"}}].
+{treelist_actions}
+Return a JSON list of actions, e.g.:
+[
+  {{"action": "add", "data": {{"Product Name": "New Item", "Unit Price": 25}}}},
+  {{"action": "edit", "where": {{"Product Name": "Chai"}}, "data": {{"Unit Price": 20.5}}}},
+  {{"action": "delete", "where": {{"Units In Stock": {{"$lt": 10}}}}}},
+  {{"action": "undo"}},
+  {{"action": "redo"}}
+]
+No explanation, only valid JSON. Use correct types (numbers, booleans, strings).
+""".format(
+        extra="/treelist" if treelist else "",
+        extra2=", toggling row expansion, and adding child rows" if treelist else "",
+        treelist_actions=(
+            """
+New actions for TreeList:
+- To expand/collapse a row: {{"action": "toggle_expand", "where": {{"First Name": "Daryl"}}}}
+- To add a child row: {{"action": "add_child", "where": {{"First Name": "Daryl"}}, "data": {{"First Name": "New Child", "Position": "Junior"}}}}
+""" if treelist else ""
+        ),
+    )
+    if not user_prompt or not user_prompt.strip():
+        print("[ERROR] No user prompt provided for plan generation!")
+        return []
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+    result = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ])
+    return result
+
+def extract_json_from_llm_response(plan_raw):
+    if hasattr(plan_raw, "content"):
+        plan_raw = plan_raw.content
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", plan_raw, re.DOTALL)
+    if match:
+        return match.group(1)
+    return plan_raw.strip()
+
+def summarize_action(actions, result_info, treelist=False):
+    system_prompt = "Summarize the grid{}/treelist actions for the user, using clear, concise English.".format("/treelist" if treelist else "")
+    user_prompt = f"Actions performed: {json.dumps(actions)}. Results: {json.dumps(result_info)}"
+    if not actions:
+        return "No actions performed."
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+    result = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ])
+    if hasattr(result, "content"):
+        return result.content.strip()
+    return str(result).strip()
+
+def parse_filter(cell_text, filter_obj):
+    for op, val in filter_obj.items():
+        try:
+            cell_val = float(cell_text)
+            val = float(val)
+        except ValueError:
+            cell_val = cell_text
+        if op == "$lt" and not (cell_val < val): return False
+        if op == "$lte" and not (cell_val <= val): return False
+        if op == "$gt" and not (cell_val > val): return False
+        if op == "$gte" and not (cell_val >= val): return False
+        if op == "$eq" and not (cell_val == val): return False
+        if op == "$ne" and not (cell_val != val): return False
+    return True
+
+async def ask_llm_for_selector(task, html_snippet, user_prompt=None):
+    if not task or not html_snippet or not str(html_snippet).strip():
+        print(f"[WARN] Skipping selector generation: missing task or HTML. Task: '{task}', HTML: '{str(html_snippet)[:80]}...'")
+        return None
+    task_note = (
+        f"{task}\n"
+        "NOTE: You are NOT looking for an 'undo' button or action. "
+        "The operation is being performed by directly editing or adding rows. "
+        "Return the selector for the input/data field ONLY, and never explain or reference undo, redo, or revert."
+    )
+    system_message_content = f"""
+You are an expert DOM automation AI.
+Given a DOM HTML snippet, return only the best **standard CSS selector** or **Playwright locator** to accomplish the following task (e.g. click a button, fill a field).
+When matching text, **prefer Playwright's `text=` or `has-text=` locators** over non-standard pseudo-classes like `:contains()`.
+Ensure the selector targets the *active* or *currently visible* element if there are multiple similar elements.
+
+Task: {task_note}
+HTML:
+{html_snippet}
+
+ONLY output the selector, NO explanation.
+"""
+    messages = [{"role": "system", "content": system_message_content}]
+    if user_prompt:
+        messages.append({"role": "user", "content": f"The user's specific command was: {user_prompt}. Please find the selector based on the task and HTML provided."})
+    else:
+        messages.append({"role": "user", "content": "Generate the best selector based on the provided task and HTML."})
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+    try:
+        result = llm.invoke(messages)
+    except Exception as e:
+        print(f"[ERROR] LLM invocation failed for selector generation. Task: '{task}', HTML Snippet (first 100 chars): '{str(html_snippet)[:100]}...'. Error: {e}")
+        return None
+    selector = str(result.content if hasattr(result, "content") else result).strip()
+    selector = re.sub(r"^`+|`+$", "", selector)
+    selector = selector.replace("```", "").strip()
+    if not selector or "no selector" in selector.lower() or "no functionality" in selector.lower() or "cannot be provided" in selector.lower():
+        print(f"[ERROR] LLM did not provide a valid selector for task '{task}'. Selector: {selector}")
+        return None
+    return selector
+
+async def get_soup(element):
+    try:
+        html = await element.inner_html()
+        if not html or not html.strip():
+            print("[WARN] Could not get inner_html (empty).")
+            return None
+    except Exception as ex:
+        print(f"[ERROR] Unable to get inner_html: {ex}")
+        return None
+    return BeautifulSoup(html, "html.parser")
+
+async def get_table_headers(component_element):
+    soup = await get_soup(component_element)
+    if not soup:
+        print("[WARN] No headers found (soup was empty).")
+        return []
+    ths = soup.select("thead th")
+    if not ths:
+        ths = soup.select(".k-grid-header-wrap th, .k-treelist-header th")
+    return [th.get_text(strip=True) for th in ths]
+
+async def get_rows(component_element):
+    soup = await get_soup(component_element)
+    if not soup:
+        print("[WARN] No rows found (soup was empty).")
+        return []
+    return soup.select("tbody tr")
+
+async def get_row_data(component_element, row_index):
+    soup = await get_soup(component_element)
+    if not soup:
+        print("[WARN] Soup empty while getting row data.")
+        return {}
+    rows = soup.select("tbody tr")
+    if row_index >= len(rows):
+        print(f"[WARN] Row index {row_index} out of range.")
+        return {}
+    row = rows[row_index]
+    cells = row.find_all("td")
+    headers = [th.get_text(strip=True) for th in soup.select("thead th")]
+    if not headers:
+        headers = [th.get_text(strip=True) for th in soup.select(".k-grid-header-wrap th, .k-treelist-header th")]
+    return {headers[i]: cells[i].get_text(strip=True) for i in range(min(len(headers), len(cells)))}
+
+async def find_row_indices_by_filter(component_element, header, filter_value):
+    headers = await get_table_headers(component_element)
+    col_idx = None
+    for i, h in enumerate(headers):
+        if h == header:
+            col_idx = i
+            break
+    if col_idx is None:
+        print(f"[WARN] Column '{header}' not found in headers: {headers}")
+        return []
+    rows = await get_rows(component_element)
+    indices = []
+    for i, row in enumerate(rows):
+        cells = row.find_all("td")
+        if col_idx < len(cells):
+            cell_val = cells[col_idx].get_text(strip=True)
+            if isinstance(filter_value, dict):
+                if parse_filter(cell_val, filter_value):
+                    indices.append(i)
+            else:
+                if cell_val == str(filter_value):
+                    indices.append(i)
+    return indices
+
+async def highlight_element(page, locator):
+    try:
+        await locator.evaluate(
+            """element => {
+                element.style.border = "2px solid red";
+                element.style.boxShadow = "0 0 10px 2px red";
+            }""", timeout=2000
+        )
+    except Exception as ex:
+        print(f"[WARN] Could not highlight element: {ex}")
+
+# =============== DRIVER CLASSES ================
+
+class AIVisionGridDriver:
+    def __init__(self, page, component_root):
+        self.page = page
+        self.component_root = component_root
+
+    async def get_header_indices(self):
+        headers = await get_table_headers(self.component_root)
+        return {h: i for i, h in enumerate(headers)}
+
+    async def get_row_data(self, row_index):
+        return await get_row_data(self.component_root, row_index)
+
+    async def add_row(self, value_map, user_prompt=None):
+        value_map = filter_editable_fields(value_map)
+        grid_html = await self.component_root.inner_html()
+        add_btn = self.component_root.locator('button[kendogridaddcommand]')
+        if await add_btn.count() == 0:
+            add_btn_selector = await ask_llm_for_selector("Find the add/new row button for this grid.", grid_html, user_prompt)
+            if not add_btn_selector:
+                print("[ERROR] No add button selector returned.")
+                return
+            add_btn = self.component_root.locator(add_btn_selector)
+        if await add_btn.count() == 0:
+            print("[ERROR] Add button not found on grid.")
+            return
+        await add_btn.click()
+        await self.page.wait_for_timeout(500)
+        editable_row_selector = "tr.k-grid-edit-row"
+        edit_row = self.component_root.locator(editable_row_selector)
+        try:
+            await edit_row.wait_for(state='visible', timeout=10000)
+        except Exception as e:
+            print(f"[ERROR] Editable row not found or visible after add click: {e}")
+            return
+        header_indices = await self.get_header_indices()
+        for header, value in value_map.items():
+            if not header or value in ("EditRemoveUpdateCancel", "Update", "Cancel"):
+                continue
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                continue
+            cell = edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()
+            except Exception as e:
+                continue
+            if not cell_html or not cell_html.strip():
+                continue
+            input_selector = await ask_llm_for_selector(f"Find the input/editor for field '{header}'", cell_html, user_prompt)
+            if not input_selector:
+                continue
+            input_elem = cell.locator(input_selector)
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    pass
+        editable_row_current_html = await edit_row.inner_html()
+        save_btn = edit_row.locator('button[kendogridsavecommand]')
+        if await save_btn.count() == 0:
+            save_btn_selector = await ask_llm_for_selector("Find the save/add/update button for this new row.", editable_row_current_html, user_prompt)
+            if not save_btn_selector:
+                return
+            save_btn = edit_row.locator(save_btn_selector)
+        if await save_btn.count() > 0:
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                pass
+
+    async def edit_row(self, row_index, value_map, user_prompt=None):
+        value_map = filter_editable_fields(value_map)
+        row_elem = self.component_root.locator(f'tbody tr').nth(row_index)
+        try:
+            await row_elem.wait_for(state='attached', timeout=5000)
+            await row_elem.wait_for(state='visible', timeout=5000)
+            row_html = await row_elem.inner_html()
+        except Exception as e:
+            return
+        if not row_html or not row_html.strip():
+            return
+        edit_btn = row_elem.locator('button[kendogrideditcommand]')
+        if await edit_btn.count() == 0:
+            edit_btn_selector = await ask_llm_for_selector("Find the edit button for this row.", row_html, user_prompt)
+            if not edit_btn_selector:
+                return
+            edit_btn = row_elem.locator(edit_btn_selector)
+        if await edit_btn.count() > 0:
+            await edit_btn.click()
+        else:
+            return
+        await self.page.wait_for_timeout(500)
+        editable_row_selector = "tr.k-grid-edit-row"
+        edit_row = self.component_root.locator(editable_row_selector)
+        try:
+            await edit_row.wait_for(state='visible', timeout=10000)
+        except Exception as e:
+            return
+        header_indices = await self.get_header_indices()
+        for header, value in value_map.items():
+            if not header or value in ("EditRemoveUpdateCancel", "Update", "Cancel"):
+                continue
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                continue
+            cell = edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()
+            except Exception as e:
+                continue
+            if not cell_html or not cell_html.strip():
+                continue
+            input_selector = await ask_llm_for_selector(
+                f"Find the input/editor for field '{header}' within this cell HTML. This should be an input or checkbox.",
+                cell_html, user_prompt)
+            if not input_selector:
+                continue
+            input_elem = cell.locator(input_selector)
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    pass
+        editable_row_current_html = await edit_row.inner_html()
+        save_btn = edit_row.locator('button[kendogridsavecommand]')
+        if await save_btn.count() == 0:
+            save_btn_selector = await ask_llm_for_selector("Find the save/update button for this currently editable row.", editable_row_current_html, user_prompt)
+            if not save_btn_selector:
+                return
+            save_btn = edit_row.locator(save_btn_selector)
+        if await save_btn.count() > 0:
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                pass
+
+    async def delete_row(self, row_index, user_prompt=None):
+        rows_soup = await get_rows(self.component_root)
+        if row_index >= len(rows_soup):
+            return
+        row_elem = self.component_root.locator(f'tbody tr').nth(row_index)
+        try:
+            await row_elem.wait_for(state='attached', timeout=5000)
+            await row_elem.wait_for(state='visible', timeout=5000)
+            row_html = await row_elem.inner_html()
+        except Exception as e:
+            return
+        if not row_html or not row_html.strip():
+            return
+        del_btn = row_elem.locator('button[kendogridremovecommand]')
+        if await del_btn.count() == 0:
+            del_btn_selector = await ask_llm_for_selector("Find the delete/remove button for this row.", row_html, user_prompt)
+            if not del_btn_selector:
+                return
+            del_btn = row_elem.locator(del_btn_selector)
+        if await del_btn.count() > 0:
+            await highlight_element(self.page, del_btn)
+            await del_btn.click()
+
+    async def find_row_indices_by_filter(self, header, filter_value):
+        return await find_row_indices_by_filter(self.component_root, header, filter_value)
+
+    async def dispatch_actions(self, actions, undo_stack, redo_stack, user_prompt=None):
+        results = []
+        for action in actions:
+            action_type = action.get("action")
+            result_info = {"action": action_type}
+            try:
+                if action_type == "add":
+                    data = action.get("data", {})
+                    await self.add_row(data, user_prompt)
+                    undo_stack.append({
+                        "action": "add",
+                        "where": data,
+                        "before": None,
+                        "after": data,
+                    })
+                    result_info["status"] = "success"
+                elif action_type == "edit":
+                    where_clause = action.get("where", {})
+                    data = action.get("data", {})
+                    filter_field = list(where_clause.keys())[0]
+                    filter_value = where_clause[filter_field]
+                    row_indices = await self.find_row_indices_by_filter(filter_field, filter_value)
+                    for idx in row_indices:
+                        before = await self.get_row_data(idx)
+                        await self.edit_row(idx, data, user_prompt)
+                        undo_stack.append({
+                            "action": "edit",
+                            "where": where_clause,
+                            "before": before,
+                            "after": data,
+                        })
+                    result_info["status"] = "success"
+                elif action_type == "delete":
+                    where_clause = action.get("where", {})
+                    filter_field = list(where_clause.keys())[0]
+                    filter_value = where_clause[filter_field]
+                    row_indices = sorted(await self.find_row_indices_by_filter(filter_field, filter_value), reverse=True)
+                    for idx in row_indices:
+                        before = await self.get_row_data(idx)
+                        await self.delete_row(idx, user_prompt)
+                        undo_stack.append({
+                            "action": "delete",
+                            "where": where_clause,
+                            "before": before,
+                            "after": None,
+                        })
+                    result_info["status"] = "success"
+                elif action_type == "undo":
+                    result = await handle_undo_redo(self, "undo", undo_stack, redo_stack, user_prompt)
+                    result_info.update(result)
+                elif action_type == "redo":
+                    result = await handle_undo_redo(self, "redo", undo_stack, redo_stack, user_prompt)
+                    result_info.update(result)
+                else:
+                    result_info["status"] = "failed"
+            except Exception as e:
+                result_info["status"] = "error"
+                result_info["message"] = str(e)
+            results.append(result_info)
+        return results
+
+# ----------- PATCHED PART: TreeList add_row --------------
+class AIVisionComponentDriver(AIVisionGridDriver):
+    async def add_row(self, value_map, user_prompt=None):
+        value_map = filter_editable_fields(value_map)
+        grid_html = await self.component_root.inner_html()
+        # Try TreeList add button first
+        add_btn = self.component_root.locator('button[kendoTreeListAddCommand]')
+        if await add_btn.count() == 0:
+            # Fallback: try toolbar button at very top of treelist
+            toolbar_add_btn = self.page.locator('button[kendoTreeListAddCommand]')
+            if await toolbar_add_btn.count() > 0:
+                add_btn = toolbar_add_btn
+        if await add_btn.count() == 0:
+            # Try LLM selector as fallback
+            add_btn_selector = await ask_llm_for_selector("Find the add/new row button for this treelist.", grid_html, user_prompt)
+            if not add_btn_selector:
+                print("[ERROR] No add button selector returned for treelist.")
+                return
+            add_btn = self.component_root.locator(add_btn_selector)
+        if await add_btn.count() == 0:
+            print("[ERROR] Add button not found on treelist.")
+            return
+        await add_btn.first.click()
+        await self.page.wait_for_timeout(500)
+        # After click, the first row is likely in edit mode
+        editable_row_selector = "tr.k-treelist-edit-row, tr.k-grid-edit-row"
+        edit_row = self.component_root.locator(editable_row_selector)
+        try:
+            await edit_row.wait_for(state='visible', timeout=10000)
+        except Exception as e:
+            print(f"[ERROR] Editable row not found or visible after add click: {e}")
+            return
+        header_indices = await self.get_header_indices()
+        for header, value in value_map.items():
+            if not header or value in ("EditRemoveUpdateCancel", "Update", "Cancel"):
+                continue
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                continue
+            cell = edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()
+            except Exception as e:
+                continue
+            if not cell_html or not cell_html.strip():
+                continue
+            input_selector = await ask_llm_for_selector(f"Find the input/editor for field '{header}'", cell_html, user_prompt)
+            if not input_selector:
+                continue
+            input_elem = cell.locator(input_selector)
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    pass
+        editable_row_current_html = await edit_row.inner_html()
+        # PATCH: Correct "Add" (save) button selector for parent row (".k-grid-save-command" NOT "kendoTreeListSaveCommand")
+        save_btn = edit_row.locator('button.k-grid-save-command')
+        if await save_btn.count() == 0:
+            save_btn_selector = await ask_llm_for_selector(
+                "Find the save/add/update button for this new treelist row.", editable_row_current_html, user_prompt)
+            if not save_btn_selector:
+                print("[ERROR] No save button selector found for treelist.")
+                return
+            save_btn = edit_row.locator(save_btn_selector)
+        if await save_btn.count() > 0:
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                print(f"[ERROR] Could not click save button: {e}")
+        else:
+            print("[ERROR] No save button visible in row.")
+
+    # You can add override for edit_row/delete_row if you need TreeList custom logic
+
+    async def dispatch_actions(self, actions, undo_stack, redo_stack, user_prompt):
+        results = []
+        for action in actions:
+            action_type = action.get("action")
+            result_info = {"action": action_type}
+            try:
+                if action_type in ("add", "edit", "delete"):
+                    r = await super().dispatch_actions([action], undo_stack, redo_stack, user_prompt)
+                    results.extend(r)
+                elif action_type == "toggle_expand":
+                    where_clause = action.get("where", {})
+                    if not where_clause:
+                        result_info["status"] = "failed"
+                        continue
+                    filter_field = list(where_clause.keys())[0]
+                    filter_value = where_clause[filter_field]
+                    row_indices = await self.find_row_indices_by_filter(filter_field, filter_value)
+                    for idx in row_indices:
+                        await self.toggle_expand_row(idx, user_prompt)
+                    result_info["status"] = "success"
+                elif action_type == "add_child":
+                    where_clause = action.get("where", {})
+                    data = action.get("data", {})
+                    if not where_clause:
+                        result_info["status"] = "failed"
+                        continue
+                    filter_field = list(where_clause.keys())[0]
+                    filter_value = where_clause[filter_field]
+                    parent_row_indices = await self.find_row_indices_by_filter(filter_field, filter_value)
+                    for idx in parent_row_indices:
+                        await self.add_child_row(idx, data, user_prompt)
+                    result_info["status"] = "success"
+                elif action_type == "undo":
+                    result = await handle_undo_redo(self, "undo", undo_stack, redo_stack, user_prompt)
+                    result_info.update(result)
+                elif action_type == "redo":
+                    result = await handle_undo_redo(self, "redo", undo_stack, redo_stack, user_prompt)
+                    result_info.update(result)
+                else:
+                    result_info["status"] = "failed"
+            except Exception as e:
+                result_info["status"] = "error"
+                result_info["message"] = str(e)
+            results.append(result_info)
+        return results
+
+    async def toggle_expand_row(self, row_index, user_prompt=None):
+        rows_soup = await get_rows(self.component_root)
+        if row_index >= len(rows_soup):
+            return
+        row_elem = self.component_root.locator(f'tbody tr').nth(row_index)
+        try:
+            await row_elem.wait_for(state='attached', timeout=5000)
+            await row_elem.wait_for(state='visible', timeout=5000)
+            row_html = await row_elem.inner_html()
+        except Exception as e:
+            return
+        if not row_html or not row_html.strip():
+            return
+        toggle_selector = await ask_llm_for_selector(
+            "Find the expand/collapse toggle button (k-treelist-toggle) within the first cell of this row.",
+            row_html, user_prompt)
+        if not toggle_selector:
+            return
+        toggle_btn = row_elem.locator(toggle_selector)
+        if await toggle_btn.count() > 0:
+            await toggle_btn.click()
+            await self.page.wait_for_timeout(500)
+            await highlight_element(self.page, toggle_btn)
+
+    async def add_child_row(self, parent_row_index, value_map, user_prompt=None):
+        value_map = filter_editable_fields(value_map)
+        rows_soup = await get_rows(self.component_root)
+        if parent_row_index >= len(rows_soup):
+            return
+        parent_row_elem = self.component_root.locator(f'tbody tr').nth(parent_row_index)
+        try:
+            await parent_row_elem.wait_for(state='attached', timeout=5000)
+            await parent_row_elem.wait_for(state='visible', timeout=5000)
+            parent_row_html = await parent_row_elem.inner_html()
+        except Exception as e:
+            return
+        if not parent_row_html or not parent_row_html.strip():
+            return
+        add_child_btn_selector = await ask_llm_for_selector("Find the 'Add Child' button for this row.", parent_row_html, user_prompt)
+        if not add_child_btn_selector:
+            return
+        add_child_btn = parent_row_elem.locator(add_child_btn_selector)
+        if await add_child_btn.count() > 0:
+            await add_child_btn.click()
+            await self.page.wait_for_timeout(500)
+            await highlight_element(self.page, add_child_btn)
+        editable_row_selector = "tr.k-grid-edit-row"
+        new_child_edit_row = self.component_root.locator(editable_row_selector)
+        try:
+            await new_child_edit_row.wait_for(state='visible', timeout=10000)
+        except Exception as e:
+            return
+        header_indices = await self.get_header_indices()
+        for header, value in value_map.items():
+            if not header or value in ("EditRemoveUpdateCancel", "Update", "Cancel"):
+                continue
+            idx = header_indices.get(header, -1)
+            if idx == -1:
+                continue
+            cell = new_child_edit_row.locator('td').nth(idx)
+            try:
+                await cell.wait_for(state='attached', timeout=5000)
+                await cell.wait_for(state='visible', timeout=5000)
+                cell_html = await cell.inner_html()
+            except Exception as e:
+                continue
+            if not cell_html or not cell_html.strip():
+                continue
+            input_selector = await ask_llm_for_selector(f"Find the input/editor for field '{header}'", cell_html, user_prompt)
+            if not input_selector:
+                continue
+            input_elem = cell.locator(input_selector)
+            if await input_elem.count() > 0:
+                try:
+                    await input_elem.first.wait_for(state='visible', timeout=5000)
+                    tag = await input_elem.first.evaluate("e => e.type || e.tagName")
+                    if tag and "checkbox" in tag:
+                        checked = await input_elem.first.is_checked()
+                        if str(value).lower() in ("true", "1", "yes"):
+                            if not checked:
+                                await input_elem.first.check()
+                        else:
+                            if checked:
+                                await input_elem.first.uncheck()
+                    else:
+                        await input_elem.first.fill(str(value))
+                    await highlight_element(self.page, input_elem.first)
+                except Exception as ex:
+                    pass
+        editable_row_current_html = await new_child_edit_row.inner_html()
+        save_btn = new_child_edit_row.locator('button.k-grid-save-command')
+        if await save_btn.count() == 0:
+            save_btn_selector = await ask_llm_for_selector("Find the save/add/update button for this new child row.", editable_row_current_html, user_prompt)
+            if not save_btn_selector:
+                return
+            save_btn = new_child_edit_row.locator(save_btn_selector)
+        if await save_btn.count() > 0:
+            try:
+                await save_btn.wait_for(state='visible', timeout=10000)
+                await save_btn.click()
+                await highlight_element(self.page, save_btn)
+            except Exception as e:
+                pass
+
+# -------- Undo/Redo Handler --------
+async def handle_undo_redo(driver, op_type, undo_stack, redo_stack, user_prompt=None):
+    stack_from = undo_stack if op_type == "undo" else redo_stack
+    stack_to   = redo_stack if op_type == "undo" else undo_stack
+
+    if not stack_from:
+        print(f"[INFO] {op_type.title()} stack is empty.")
+        return {"status": "failed", "message": f"Nothing to {op_type}."}
+
+    action_entry = stack_from.pop()
+    stack_to.append(action_entry)
+
+    action = action_entry["action"]
+    where  = action_entry.get("where", {})
+    before = action_entry.get("before", {})
+    after  = action_entry.get("after", {})
+
+    filtered_before = filter_editable_fields(before or {})
+    filtered_after = filter_editable_fields(after or {})
+
+    if op_type == "undo":
+        if action == "add":
+            print("[UNDO] Deleting the row that was just added:", after)
+            indices = await driver.find_row_indices_by_filter(
+                list(filtered_after.keys())[0], list(filtered_after.values())[0])
+            if indices:
+                for idx in indices:
+                    try:
+                        await driver.delete_row(idx, user_prompt)
+                    except Exception as e:
+                        print(f"[ERROR] Undo add: Could not delete row. {e}")
+                        return {"status": "failed", "message": f"Undo add failed: Could not delete row. {e}"}
+                return {"status": "success", "message": "Undo add: deleted the row."}
+            else:
+                print("[WARN] Undo add: Could not find added row to delete.")
+                return {"status": "failed", "message": "Undo add: Could not find added row to delete."}
+        elif action == "edit":
+            print("[UNDO] Reverting the row to previous values:", before)
+            indices = await driver.find_row_indices_by_filter(
+                list(where.keys())[0], list(where.values())[0])
+            if indices:
+                for idx in indices:
+                    try:
+                        await driver.edit_row(idx, filtered_before, user_prompt)
+                    except Exception as e:
+                        print(f"[ERROR] Undo edit: Could not revert row. {e}")
+                        return {"status": "failed", "message": f"Undo edit failed: Could not revert row. {e}"}
+                return {"status": "success", "message": "Undo edit: reverted to previous values."}
+            else:
+                print("[WARN] Undo edit: Could not find row to revert.")
+                return {"status": "failed", "message": "Undo edit: Could not find row to revert."}
+        elif action == "delete":
+            print("[UNDO] Re-adding the row that was deleted:", before)
+            if filtered_before:
+                try:
+                    await driver.add_row(filtered_before, user_prompt)
+                    return {"status": "success", "message": "Undo delete: row restored."}
+                except Exception as e:
+                    print(f"[ERROR] Undo delete: Could not re-add row. {e}")
+                    return {"status": "failed", "message": f"Undo delete failed: Could not re-add row. {e}"}
+            else:
+                print("[WARN] Undo delete: No data to re-add.")
+                return {"status": "failed", "message": "Undo delete: No data to re-add."}
+    else:  # Redo
+        if action == "add":
+            print("[REDO] Re-adding the row:", after)
+            if filtered_after:
+                try:
+                    await driver.add_row(filtered_after, user_prompt)
+                    return {"status": "success", "message": "Redo add: row re-added."}
+                except Exception as e:
+                    print(f"[ERROR] Redo add: Could not re-add row. {e}")
+                    return {"status": "failed", "message": f"Redo add failed: Could not re-add row. {e}"}
+            else:
+                print("[WARN] Redo add: No data to re-add.")
+                return {"status": "failed", "message": "Redo add: No data to re-add."}
+        elif action == "edit":
+            print("[REDO] Re-applying the edit:", after)
+            indices = await driver.find_row_indices_by_filter(
+                list(where.keys())[0], list(where.values())[0])
+            if indices:
+                for idx in indices:
+                    try:
+                        await driver.edit_row(idx, filtered_after, user_prompt)
+                    except Exception as e:
+                        print(f"[ERROR] Redo edit: Could not re-edit row. {e}")
+                        return {"status": "failed", "message": f"Redo edit failed: Could not re-edit row. {e}"}
+                return {"status": "success", "message": "Redo edit: values reapplied."}
+            else:
+                print("[WARN] Redo edit: Could not find row to edit.")
+                return {"status": "failed", "message": "Redo edit: Could not find row to edit."}
+        elif action == "delete":
+            print("[REDO] Re-deleting the row:", before)
+            indices = await driver.find_row_indices_by_filter(
+                list(filtered_before.keys())[0], list(filtered_before.values())[0])
+            if indices:
+                for idx in indices:
+                    try:
+                        await driver.delete_row(idx, user_prompt)
+                    except Exception as e:
+                        print(f"[ERROR] Redo delete: Could not delete row. {e}")
+                        return {"status": "failed", "message": f"Redo delete failed: Could not delete row. {e}"}
+                return {"status": "success", "message": "Redo delete: row re-deleted."}
+            else:
+                print("[WARN] Redo delete: Could not find row to delete.")
+                return {"status": "failed", "message": "Redo delete: Could not find row to delete."}
+
+    print("[WARN] Unknown undo/redo type for", action)
+    return {"status": "failed", "message": f"Unknown undo/redo type for {action}"}
+
+# ============= MAIN LOOP =============
+
+async def main():
+    undo_stack, redo_stack = [], []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        page = await browser.new_page()
+        while True:
+            url = input("Paste your grid/table/treelist URL (type 'exit' to quit): ").strip()
+            if url.lower() == 'exit':
+                await browser.close()
+                return
+            try:
+                await page.goto(url, timeout=60000)
+                await page.wait_for_load_state('networkidle')
+                break
+            except Exception as e:
+                print(f"[ERROR] Could not navigate to URL or page did not load: {e}. Try again.")
+
+        treelist_selector = ".k-treelist"
+        grid_selector = "kendo-grid"
+        component_root = None
+        driver = None
+        treelist = False
+
+        if await page.locator(treelist_selector).count() > 0:
+            component_root = page.locator(treelist_selector)
+            treelist = True
+            print("[INFO] Detected TreeList component. Using TreeList driver.")
+            driver = AIVisionComponentDriver(page, component_root)
+        elif await page.locator(grid_selector).count() > 0:
+            component_root = page.locator(grid_selector)
+            treelist = False
+            print("[INFO] Detected Kendo Grid component. Using Grid driver.")
+            driver = AIVisionGridDriver(page, component_root)
+        else:
+            tables = page.locator("table:has(thead):has(tbody)")
+            if await tables.count() > 0:
+                component_root = tables.first
+                print("[INFO] Detected generic HTML table. Using Grid driver.")
+                driver = AIVisionGridDriver(page, component_root)
+                treelist = False
+
+        if not component_root or not await component_root.count():
+            print("[ERROR] No grid/table/treelist found. Exiting.")
+            await browser.close()
+            return
+
+        while True:
+            user_prompt = input("\nEnter grid/treelist command (type 'exit' to quit, 'undo', 'redo'): ").strip()
+            if user_prompt.lower() == 'exit':
+                break
+            plan_raw = prompt_to_plan(user_prompt, treelist=treelist)
+            plan_str = extract_json_from_llm_response(plan_raw)
+            try:
+                actions = json.loads(plan_str)
+                if not isinstance(actions, list):
+                    raise ValueError("LLM response is not a JSON list.")
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"[ERROR] Could not parse LLM response as valid JSON list: {e}")
+                print("Raw LLM response:", plan_raw)
+                continue
+
+            results = await driver.dispatch_actions(actions, undo_stack, redo_stack, user_prompt)
+            summary = summarize_action(actions, results, treelist=treelist)
+            print(f"🔎 AI Summary:\n{summary}")
+
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
