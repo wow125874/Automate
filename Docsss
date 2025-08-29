@@ -1,0 +1,72 @@
+you are an expert in architecting dotnet applications with ai from scratch
+
+I will provide overview of my project text can you design me the architecture with LLD and HLD and all documents?
+
+also can you suggest best design pattern for my requirement?
+
+below is the document with all details of project
+
+project titile : Lateral Hire Onboarding Application 
+
+1.Purpose : To design and implement a dynamic onboarding for lateral hires that provides a personalized learning journey based on service line and experience level.the application will automate task verification using external APIs and enhance user experience through AI-Powered assistance 
+
+2.Scope: This application will
+1.Support onboarding for lateral hires accross multiple service lines.
+2.provide personalized training journeys
+3.integrate with external systems for task verification 
+4.include AI assistant features for supporting and nudging
+5.offer admin configuration and reporting capabilities 
+
+3.Functinal Requirements 
+3.1 Admin Configuration 
+  1.Upload or manually create master data:
+-Service lines
+-Experience Levels
+-Course paths
+-Courses,Modules,topics
+-Topic content(videos,documents,links)
+2.Define journey templates with
+-Duration
+-Training modules
+-Completion timelines
+
+3.2 User Onboarding 
+-New joiner login and profile creation 
+-Auto mapping of user profile to learning path using rules : service line + experience levels
+-Display personalized dashboard with assigned journey
+
+3.3 Learning journey 
+- sequential navigation through : coursers->modules ->topics
+-Each topic includes :content (video,text,documents),Tasks (external activities)
+-Task verification:
+a.Integrate with external APIs to verify task completion
+b.Auto-Update progress status based on API response 
+
+3.4 AI Assistant Integration 
+- FAQ chatbot for onboarding queries
+- Document sunmarzation
+- Task verification via API response interpretation 
+- progress nudges via email/chat
+- Logging of AI interactions
+
+3.5 Reporting & Analytics 
+Admin dashboard with:
+- User progress tracking 
+- Completion rates
+- AI agent activity 
+- Feedback collection 
+
+4 Non-functional Requirements 
+- Scalability : Support multiple service lines and experience levels
+- security: Role-bases access control , data encryption,audit logs
+- Performance: Fast response times for dashboard and AI interactions
+- Usability: intuitive UI for both user and admins
+- Maintainability: Modular architecture for easy updates
+
+5 Technology Stack
+- Frontend: Angular
+- Backend : C#.Net Core
+- Cloud : Azure (Sql,Blob storage,Functions)
+- AI : AI boundary (Azure Open ai Integrations)
+
+
