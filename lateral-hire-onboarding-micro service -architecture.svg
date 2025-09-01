@@ -1,0 +1,167 @@
+<svg width="1200" height="800" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .service-box { fill: #e3f2fd; stroke: #1976d2; stroke-width: 2; }
+      .gateway-box { fill: #f3e5f5; stroke: #7b1fa2; stroke-width: 2; }
+      .data-box { fill: #e8f5e8; stroke: #388e3c; stroke-width: 2; }
+      .external-box { fill: #fff3e0; stroke: #f57c00; stroke-width: 2; }
+      .text { font-family: Arial, sans-serif; font-size: 12px; text-anchor: middle; }
+      .title { font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; text-anchor: middle; }
+      .arrow { stroke: #333; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .bidirectional { stroke: #666; stroke-width: 1.5; fill: none; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+  </defs>
+  
+  <!-- Title -->
+  <text x="600" y="30" class="title" font-size="18">Lateral Hire Onboarding - Microservices Architecture Flow</text>
+  
+  <!-- Frontend Layer -->
+  <rect x="450" y="60" width="300" height="60" class="external-box" rx="5"/>
+  <text x="600" y="85" class="title">Frontend Layer</text>
+  <text x="600" y="105" class="text">Angular 16 SPA</text>
+  
+  <!-- API Gateway -->
+  <rect x="450" y="160" width="300" height="80" class="gateway-box" rx="5"/>
+  <text x="600" y="185" class="title">API Gateway</text>
+  <text x="600" y="205" class="text">LateralHireOnboarding.API</text>
+  <text x="600" y="225" class="text">Unified Entry Point</text>
+  
+  <!-- Core Services Layer -->
+  <rect x="50" y="280" width="180" height="100" class="service-box" rx="5"/>
+  <text x="140" y="305" class="title">User Management</text>
+  <text x="140" y="325" class="text">UserManagement.Service</text>
+  <text x="140" y="345" class="text">• Authentication</text>
+  <text x="140" y="365" class="text">• User Profiles</text>
+  
+  <rect x="270" y="280" width="180" height="100" class="service-box" rx="5"/>
+  <text x="360" y="305" class="title">Learning Journey</text>
+  <text x="360" y="325" class="text">LearningJourney.Service</text>
+  <text x="360" y="345" class="text">• Path Creation</text>
+  <text x="360" y="365" class="text">• Progress Tracking</text>
+  
+  <rect x="490" y="280" width="180" height="100" class="service-box" rx="5"/>
+  <text x="580" y="305" class="title">Task Verification</text>
+  <text x="580" y="325" class="text">TaskVerification.Service</text>
+  <text x="580" y="345" class="text">• Auto Verification</text>
+  <text x="580" y="365" class="text">• External APIs</text>
+  
+  <rect x="710" y="280" width="180" height="100" class="service-box" rx="5"/>
+  <text x="800" y="305" class="title">AI Assistant</text>
+  <text x="800" y="325" class="text">AIAssistant.Service</text>
+  <text x="800" y="345" class="text">• ChatBot</text>
+  <text x="800" y="365" class="text">• Recommendations</text>
+  
+  <!-- Shared Services -->
+  <rect x="950" y="280" width="180" height="100" class="service-box" rx="5"/>
+  <text x="1040" y="305" class="title">Shared Services</text>
+  <text x="1040" y="325" class="text">Core Infrastructure</text>
+  <text x="1040" y="345" class="text">• Notifications</text>
+  <text x="1040" y="365" class="text">• Scoring</text>
+  
+  <!-- Data Layer -->
+  <rect x="150" y="420" width="150" height="80" class="data-box" rx="5"/>
+  <text x="225" y="445" class="title">User Data</text>
+  <text x="225" y="465" class="text">In-Memory</text>
+  <text x="225" y="485" class="text">(SQL Ready)</text>
+  
+  <rect x="350" y="420" width="150" height="80" class="data-box" rx="5"/>
+  <text x="425" y="445" class="title">Journey Data</text>
+  <text x="425" y="465" class="text">In-Memory</text>
+  <text x="425" y="485" class="text">(SQL Ready)</text>
+  
+  <rect x="550" y="420" width="150" height="80" class="data-box" rx="5"/>
+  <text x="625" y="445" class="title">Task Data</text>
+  <text x="625" y="465" class="text">In-Memory</text>
+  <text x="625" y="485" class="text">(SQL Ready)</text>
+  
+  <rect x="750" y="420" width="150" height="80" class="data-box" rx="5"/>
+  <text x="825" y="445" class="title">AI Data</text>
+  <text x="825" y="465" class="text">In-Memory</text>
+  <text x="825" y="485" class="text">(Cosmos Ready)</text>
+  
+  <!-- External Systems -->
+  <rect x="50" y="540" width="120" height="60" class="external-box" rx="5"/>
+  <text x="110" y="565" class="title">GitHub API</text>
+  <text x="110" y="585" class="text">Code Verification</text>
+  
+  <rect x="200" y="540" width="120" height="60" class="external-box" rx="5"/>
+  <text x="260" y="565" class="title">Jira API</text>
+  <text x="260" y="585" class="text">Task Tracking</text>
+  
+  <rect x="350" y="540" width="120" height="60" class="external-box" rx="5"/>
+  <text x="410" y="565" class="title">Slack API</text>
+  <text x="410" y="585" class="text">Communication</text>
+  
+  <rect x="750" y="540" width="150" height="60" class="external-box" rx="5"/>
+  <text x="825" y="565" class="title">Azure OpenAI</text>
+  <text x="825" y="585" class="text">AI Services</text>
+  
+  <!-- Future Services -->
+  <rect x="950" y="420" width="180" height="180" class="service-box" rx="5" stroke-dasharray="5,5"/>
+  <text x="1040" y="445" class="title">Future Services</text>
+  <text x="1040" y="470" class="text">• Analytics Service</text>
+  <text x="1040" y="490" class="text">• Integration Service</text>
+  <text x="1040" y="510" class="text">• Compliance Service</text>
+  <text x="1040" y="530" class="text">• Mobile API Service</text>
+  <text x="1040" y="550" class="text">• Workflow Service</text>
+  <text x="1040" y="570" class="text">• Reporting Service</text>
+  <text x="1040" y="590" class="text">• Security Service</text>
+  
+  <!-- Communication Arrows -->
+  <!-- Frontend to Gateway -->
+  <line x1="600" y1="120" x2="600" y2="160" class="arrow"/>
+  
+  <!-- Gateway to Services -->
+  <line x1="520" y1="240" x2="140" y2="280" class="arrow"/>
+  <line x1="560" y1="240" x2="360" y2="280" class="arrow"/>
+  <line x1="600" y1="240" x2="580" y2="280" class="arrow"/>
+  <line x1="640" y1="240" x2="800" y2="280" class="arrow"/>
+  <line x1="680" y1="240" x2="1040" y2="280" class="arrow"/>
+  
+  <!-- Services to Data -->
+  <line x1="140" y1="380" x2="225" y2="420" class="arrow"/>
+  <line x1="360" y1="380" x2="425" y2="420" class="arrow"/>
+  <line x1="580" y1="380" x2="625" y2="420" class="arrow"/>
+  <line x1="800" y1="380" x2="825" y2="420" class="arrow"/>
+  
+  <!-- Services to External APIs -->
+  <line x1="580" y1="380" x2="110" y2="540" class="bidirectional"/>
+  <line x1="580" y1="380" x2="260" y2="540" class="bidirectional"/>
+  <line x1="580" y1="380" x2="410" y2="540" class="bidirectional"/>
+  <line x1="800" y1="380" x2="825" y2="540" class="bidirectional"/>
+  
+  <!-- Inter-service Communication -->
+  <line x1="230" y1="330" x2="270" y2="330" class="bidirectional"/>
+  <line x1="450" y1="330" x2="490" y2="330" class="bidirectional"/>
+  <line x1="670" y1="330" x2="710" y2="330" class="bidirectional"/>
+  <line x1="890" y1="330" x2="950" y2="330" class="bidirectional"/>
+  
+  <!-- Legend -->
+  <rect x="50" y="650" width="400" height="120" fill="none" stroke="#ccc" stroke-width="1"/>
+  <text x="250" y="670" class="title">Legend</text>
+  
+  <rect x="70" y="680" width="20" height="15" class="service-box"/>
+  <text x="100" y="692" class="text">Microservice</text>
+  
+  <rect x="200" y="680" width="20" height="15" class="gateway-box"/>
+  <text x="230" y="692" class="text">API Gateway</text>
+  
+  <rect x="320" y="680" width="20" height="15" class="data-box"/>
+  <text x="350" y="692" class="text">Data Store</text>
+  
+  <rect x="70" y="710" width="20" height="15" class="external-box"/>
+  <text x="100" y="722" class="text">External System</text>
+  
+  <rect x="200" y="710" width="20" height="15" class="service-box" stroke-dasharray="3,3"/>
+  <text x="230" y="722" class="text">Future Service</text>
+  
+  <line x1="70" y1="740" x2="90" y2="740" class="arrow"/>
+  <text x="100" y="745" class="text">API Call</text>
+  
+  <line x1="200" y1="740" x2="220" y2="740" class="bidirectional"/>
+  <text x="230" y="745" class="text">Bidirectional</text>
+  
+</svg>

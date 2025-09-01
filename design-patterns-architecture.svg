@@ -1,0 +1,229 @@
+<svg width="1400" height="1000" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .pattern-box { fill: #e3f2fd; stroke: #1976d2; stroke-width: 2; }
+      .creational-box { fill: #f3e5f5; stroke: #7b1fa2; stroke-width: 2; }
+      .structural-box { fill: #e8f5e8; stroke: #388e3c; stroke-width: 2; }
+      .behavioral-box { fill: #fff3e0; stroke: #f57c00; stroke-width: 2; }
+      .enterprise-box { fill: #fce4ec; stroke: #c2185b; stroke-width: 2; }
+      .text { font-family: Arial, sans-serif; font-size: 11px; text-anchor: middle; }
+      .title { font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; text-anchor: middle; }
+      .category-title { font-family: Arial, sans-serif; font-size: 15px; font-weight: bold; text-anchor: middle; }
+      .arrow { stroke: #333; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .interaction { stroke: #666; stroke-width: 1.5; fill: none; stroke-dasharray: 5,5; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+  </defs>
+  
+  <!-- Title -->
+  <text x="700" y="30" class="category-title" font-size="18">Design Patterns Architecture Flow - Lateral Hire Onboarding</text>
+  
+  <!-- Architectural Patterns Layer -->
+  <rect x="50" y="60" width="1300" height="120" fill="#f5f5f5" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="700" y="85" class="category-title">Architectural Patterns</text>
+  
+  <rect x="100" y="100" width="200" height="60" class="pattern-box" rx="3"/>
+  <text x="200" y="120" class="title">Microservices</text>
+  <text x="200" y="140" class="text">Service Decomposition</text>
+  
+  <rect x="350" y="100" width="200" height="60" class="pattern-box" rx="3"/>
+  <text x="450" y="120" class="title">Layered Architecture</text>
+  <text x="450" y="140" class="text">Separation of Concerns</text>
+  
+  <rect x="600" y="100" width="200" height="60" class="pattern-box" rx="3"/>
+  <text x="700" y="120" class="title">API Gateway</text>
+  <text x="700" y="140" class="text">Unified Entry Point</text>
+  
+  <rect x="850" y="100" width="200" height="60" class="pattern-box" rx="3"/>
+  <text x="950" y="120" class="title">Event-Driven</text>
+  <text x="950" y="140" class="text">Loose Coupling</text>
+  
+  <!-- Creational Patterns -->
+  <rect x="50" y="200" width="320" height="180" fill="#fafafa" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="210" y="225" class="category-title">Creational Patterns</text>
+  
+  <rect x="80" y="240" width="120" height="50" class="creational-box" rx="3"/>
+  <text x="140" y="260" class="title">Factory</text>
+  <text x="140" y="275" class="text">Object Creation</text>
+  
+  <rect x="220" y="240" width="120" height="50" class="creational-box" rx="3"/>
+  <text x="280" y="260" class="title">DI Container</text>
+  <text x="280" y="275" class="text">Dependency Injection</text>
+  
+  <rect x="80" y="310" width="120" height="50" class="creational-box" rx="3"/>
+  <text x="140" y="330" class="title">Builder</text>
+  <text x="140" y="345" class="text">Complex Objects</text>
+  
+  <rect x="220" y="310" width="120" height="50" class="creational-box" rx="3"/>
+  <text x="280" y="330" class="title">Singleton</text>
+  <text x="280" y="345" class="text">Single Instance</text>
+  
+  <!-- Structural Patterns -->
+  <rect x="390" y="200" width="320" height="180" fill="#fafafa" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="550" y="225" class="category-title">Structural Patterns</text>
+  
+  <rect x="420" y="240" width="120" height="50" class="structural-box" rx="3"/>
+  <text x="480" y="260" class="title">Repository</text>
+  <text x="480" y="275" class="text">Data Access</text>
+  
+  <rect x="560" y="240" width="120" height="50" class="structural-box" rx="3"/>
+  <text x="620" y="260" class="title">Adapter</text>
+  <text x="620" y="275" class="text">Interface Conversion</text>
+  
+  <rect x="420" y="310" width="120" height="50" class="structural-box" rx="3"/>
+  <text x="480" y="330" class="title">Facade</text>
+  <text x="480" y="345" class="text">Simplified Interface</text>
+  
+  <rect x="560" y="310" width="120" height="50" class="structural-box" rx="3"/>
+  <text x="620" y="330" class="title">Decorator</text>
+  <text x="620" y="345" class="text">Behavior Extension</text>
+  
+  <!-- Behavioral Patterns -->
+  <rect x="730" y="200" width="320" height="180" fill="#fafafa" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="890" y="225" class="category-title">Behavioral Patterns</text>
+  
+  <rect x="760" y="240" width="120" height="50" class="behavioral-box" rx="3"/>
+  <text x="820" y="260" class="title">Strategy</text>
+  <text x="820" y="275" class="text">Algorithm Selection</text>
+  
+  <rect x="900" y="240" width="120" height="50" class="behavioral-box" rx="3"/>
+  <text x="960" y="260" class="title">Observer</text>
+  <text x="960" y="275" class="text">Event Handling</text>
+  
+  <rect x="760" y="310" width="120" height="50" class="behavioral-box" rx="3"/>
+  <text x="820" y="330" class="title">Command</text>
+  <text x="820" y="345" class="text">Request Encapsulation</text>
+  
+  <rect x="900" y="310" width="120" height="50" class="behavioral-box" rx="3"/>
+  <text x="960" y="330" class="title">Template Method</text>
+  <text x="960" y="345" class="text">Algorithm Structure</text>
+  
+  <!-- Enterprise Patterns -->
+  <rect x="1070" y="200" width="280" height="180" fill="#fafafa" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="1210" y="225" class="category-title">Enterprise Patterns</text>
+  
+  <rect x="1100" y="240" width="100" height="50" class="enterprise-box" rx="3"/>
+  <text x="1150" y="260" class="title">CQRS</text>
+  <text x="1150" y="275" class="text">Read/Write Split</text>
+  
+  <rect x="1220" y="240" width="100" height="50" class="enterprise-box" rx="3"/>
+  <text x="1270" y="260" class="title">Unit of Work</text>
+  <text x="1270" y="275" class="text">Transaction Mgmt</text>
+  
+  <rect x="1100" y="310" width="100" height="50" class="enterprise-box" rx="3"/>
+  <text x="1150" y="330" class="title">Specification</text>
+  <text x="1150" y="345" class="text">Business Rules</text>
+  
+  <rect x="1220" y="310" width="100" height="50" class="enterprise-box" rx="3"/>
+  <text x="1270" y="330" class="title">Domain Events</text>
+  <text x="1270" y="345" class="text">Event Sourcing</text>
+  
+  <!-- Implementation Flow -->
+  <rect x="50" y="400" width="1300" height="300" fill="#f9f9f9" stroke="#ccc" stroke-width="1" rx="5"/>
+  <text x="700" y="425" class="category-title">Pattern Implementation Flow</text>
+  
+  <!-- Request Flow -->
+  <rect x="100" y="450" width="100" height="40" class="pattern-box" rx="3"/>
+  <text x="150" y="475" class="title">Client Request</text>
+  
+  <rect x="250" y="450" width="100" height="40" class="pattern-box" rx="3"/>
+  <text x="300" y="475" class="title">API Gateway</text>
+  
+  <rect x="400" y="450" width="100" height="40" class="creational-box" rx="3"/>
+  <text x="450" y="475" class="title">DI Container</text>
+  
+  <rect x="550" y="450" width="100" height="40" class="structural-box" rx="3"/>
+  <text x="600" y="475" class="title">Controller</text>
+  
+  <rect x="700" y="450" width="100" height="40" class="behavioral-box" rx="3"/>
+  <text x="750" y="475" class="title">Service Layer</text>
+  
+  <!-- Business Logic Flow -->
+  <rect x="200" y="520" width="100" height="40" class="creational-box" rx="3"/>
+  <text x="250" y="545" class="title">Factory</text>
+  
+  <rect x="350" y="520" width="100" height="40" class="behavioral-box" rx="3"/>
+  <text x="400" y="545" class="title">Strategy</text>
+  
+  <rect x="500" y="520" width="100" height="40" class="behavioral-box" rx="3"/>
+  <text x="550" y="545" class="title">Command</text>
+  
+  <rect x="650" y="520" width="100" height="40" class="enterprise-box" rx="3"/>
+  <text x="700" y="545" class="title">Specification</text>
+  
+  <rect x="800" y="520" width="100" height="40" class="behavioral-box" rx="3"/>
+  <text x="850" y="545" class="title">Observer</text>
+  
+  <!-- Data Access Flow -->
+  <rect x="300" y="590" width="100" height="40" class="structural-box" rx="3"/>
+  <text x="350" y="615" class="title">Repository</text>
+  
+  <rect x="450" y="590" width="100" height="40" class="enterprise-box" rx="3"/>
+  <text x="500" y="615" class="title">Unit of Work</text>
+  
+  <rect x="600" y="590" width="100" height="40" class="structural-box" rx="3"/>
+  <text x="650" y="615" class="title">Adapter</text>
+  
+  <rect x="750" y="590" width="100" height="40" class="enterprise-box" rx="3"/>
+  <text x="800" y="615" class="title">CQRS</text>
+  
+  <!-- Flow Arrows -->
+  <line x1="200" y1="470" x2="250" y2="470" class="arrow"/>
+  <line x1="350" y1="470" x2="400" y2="470" class="arrow"/>
+  <line x1="500" y1="470" x2="550" y2="470" class="arrow"/>
+  <line x1="650" y1="470" x2="700" y2="470" class="arrow"/>
+  
+  <line x1="750" y1="490" x2="400" y2="520" class="arrow"/>
+  <line x1="400" y1="540" x2="500" y2="540" class="arrow"/>
+  <line x1="600" y1="540" x2="650" y2="540" class="arrow"/>
+  <line x1="750" y1="540" x2="800" y2="540" class="arrow"/>
+  
+  <line x1="400" y1="560" x2="350" y2="590" class="arrow"/>
+  <line x1="500" y1="560" x2="500" y2="590" class="arrow"/>
+  <line x1="650" y1="560" x2="650" y2="590" class="arrow"/>
+  <line x1="800" y1="560" x2="800" y2="590" class="arrow"/>
+  
+  <!-- Pattern Interactions -->
+  <line x1="200" y1="160" x2="280" y2="240" class="interaction"/>
+  <line x1="450" y1="160" x2="480" y2="240" class="interaction"/>
+  <line x1="700" y1="160" x2="820" y2="240" class="interaction"/>
+  <line x1="950" y1="160" x2="960" y2="240" class="interaction"/>
+  
+  <!-- Legend -->
+  <rect x="50" y="730" width="500" height="120" fill="none" stroke="#ccc" stroke-width="1"/>
+  <text x="300" y="750" class="category-title">Pattern Categories & Interactions</text>
+  
+  <rect x="70" y="760" width="15" height="15" class="pattern-box"/>
+  <text x="95" y="772" class="text">Architectural</text>
+  
+  <rect x="170" y="760" width="15" height="15" class="creational-box"/>
+  <text x="195" y="772" class="text">Creational</text>
+  
+  <rect x="260" y="760" width="15" height="15" class="structural-box"/>
+  <text x="285" y="772" class="text">Structural</text>
+  
+  <rect x="350" y="760" width="15" height="15" class="behavioral-box"/>
+  <text x="375" y="772" class="text">Behavioral</text>
+  
+  <rect x="450" y="760" width="15" height="15" class="enterprise-box"/>
+  <text x="475" y="772" class="text">Enterprise</text>
+  
+  <line x1="70" y1="790" x2="90" y2="790" class="arrow"/>
+  <text x="100" y="795" class="text">Direct Flow</text>
+  
+  <line x1="200" y1="790" x2="220" y2="790" class="interaction"/>
+  <text x="230" y="795" class="text">Pattern Interaction</text>
+  
+  <!-- Problem-Solution Mapping -->
+  <rect x="600" y="730" width="700" height="120" fill="none" stroke="#ccc" stroke-width="1"/>
+  <text x="950" y="750" class="category-title">Key Problems Solved</text>
+  
+  <text x="620" y="770" class="text">• Object Creation Complexity → Factory, DI Container</text>
+  <text x="620" y="785" class="text">• Data Access Abstraction → Repository, Unit of Work</text>
+  <text x="620" y="800" class="text">• Algorithm Variation → Strategy, Template Method</text>
+  <text x="620" y="815" class="text">• Event Handling → Observer, Domain Events</text>
+  <text x="620" y="830" class="text">• External Integration → Adapter, Facade</text>
+  
+</svg>
